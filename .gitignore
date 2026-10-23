@@ -1,0 +1,17 @@
+.env
+venv/
+.venv/
+.venv39/
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
+.pytest_cache/
+
+# fitted / trained artifacts and local data (never commit signing keys!)
+artifacts/
+data/
+forensic_reports/
+reports/
+canary/*
+!canary/manifest.example.json

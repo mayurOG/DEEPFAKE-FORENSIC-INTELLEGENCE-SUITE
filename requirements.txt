@@ -1,0 +1,39 @@
+# --- UI ---
+# Streamlit 1.50+ requires Python 3.10+, so keep the project compatible with
+# the working Python 3.9 environment used for this dataset training run.
+streamlit>=1.31,<1.40
+plotly>=5.18
+pandas>=2.0
+
+# --- Core numerics / imaging ---
+# Keep NumPy on the 1.x line for Python 3.9 compatibility with pandas/scikit-learn
+# and to avoid binary ABI mismatches during import.
+numpy>=1.26,<2.0
+scipy>=1.11
+scikit-learn>=1.3
+Pillow>=10.0
+opencv-python>=4.8
+matplotlib>=3.8
+jinja2>=3.1
+python-dotenv>=1.0
+
+# --- Deep learning ---
+torch>=2.2
+torchvision>=0.17
+torchaudio>=2.2
+transformers>=4.40
+huggingface_hub>=0.23
+soundfile>=0.12
+
+# --- Face detection (MTCNN) ---
+# If pip complains about a torch/numpy version conflict, install it with
+#   pip install --no-deps facenet-pytorch
+# The app falls back to an OpenCV detector if it is missing.
+facenet-pytorch>=2.5.3
+
+# --- Signed reports (Ed25519) ---
+cryptography>=42.0
+
+# C2PA cryptographic verification (optional but recommended; newer releases need
+# Python 3.10+, so keep this optional for Python 3.9 setups).
+c2pa-python>=0.30; python_version >= "3.10"

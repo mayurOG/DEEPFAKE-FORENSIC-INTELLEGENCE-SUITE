@@ -1,0 +1,7 @@
+{
+  "_comment": "Copy to canary/manifest.json. Paths are relative to this file. label: 1 = fake, 0 = real. Add samples from the NEWEST generators you can obtain, plus a few real ones.",
+  "items": [
+    {"path": "new_generator_sample_01.jpg", "label": 1, "generator": "ExampleGenerator", "added": "2026-10"},
+    {"path": "real_sample_01.jpg", "label": 0, "generator": "camera", "added": "2026-10"}
+  ]
+}
