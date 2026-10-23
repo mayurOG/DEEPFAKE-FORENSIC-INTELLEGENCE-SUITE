@@ -56,13 +56,16 @@ def _pick_image(item: Item, rng) -> Image.Image:
 def _features(model, pixel_values, torch):
     if hasattr(model, "get_image_features"):
         f = model.get_image_features(pixel_values=pixel_values)
-        if not hasattr(f, "shape"):
-            f = getattr(f, "pooler_output", f[0])
+        if not hasattr(f, "shape") and not hasattr(f, "detach"):
+            pooler = getattr(f, "pooler_output", None)
+            f = pooler if (pooler is not None and hasattr(pooler, "shape")) else getattr(f, "last_hidden_state", f[0])
     else:
         o = model(pixel_values=pixel_values)
         f = getattr(o, "pooler_output", None)
         if f is None:
             f = o.last_hidden_state.mean(dim=1)
+    if hasattr(f, "ndim") and f.ndim == 3:
+        f = f.mean(dim=1)
     return torch.nn.functional.normalize(f.float(), dim=-1)
 
 

@@ -99,8 +99,32 @@ def _token() -> Optional[str]:
     return get_settings().hf_token or None
 
 
+def _extract_tensor(out):
+    """Extract a Tensor from model output (Tensor, ModelOutput, tuple, etc.)."""
+    if hasattr(out, "detach"):
+        return out
+    pooler = getattr(out, "pooler_output", None)
+    if pooler is not None and hasattr(pooler, "detach"):
+        return pooler
+    lhs = getattr(out, "last_hidden_state", None)
+    if lhs is not None and hasattr(lhs, "detach"):
+        return lhs
+    logits = getattr(out, "logits", None)
+    if logits is not None and hasattr(logits, "detach"):
+        return logits
+    if hasattr(out, "__getitem__"):
+        try:
+            first = out[0]
+            if hasattr(first, "detach"):
+                return first
+        except Exception:
+            pass
+    raise ValueError(f"Could not extract tensor from output of type {type(out)}")
+
+
 def _pool_hidden(hidden) -> np.ndarray:
     """Mean-pool a hidden state tensor (n, tokens, d) -> (n, d)."""
+    hidden = _extract_tensor(hidden)
     h = hidden.detach().float().cpu().numpy()
     if h.ndim == 3:
         return h.mean(axis=1)
@@ -250,13 +274,14 @@ def embed_with_encoder(model, processor, images, device, torch, batch_size=16):
         with torch.inference_mode():
             if hasattr(model, "get_image_features"):
                 feats = model.get_image_features(pixel_values=inputs["pixel_values"])
-                if not hasattr(feats, "detach"):  # newer versions return objects
-                    feats = getattr(feats, "pooler_output", feats[0])
             else:
                 o = model(**inputs)
                 feats = getattr(o, "pooler_output", None)
                 if feats is None:
                     feats = o.last_hidden_state.mean(dim=1)
+            feats = _extract_tensor(feats)
+            if feats.ndim == 3:
+                feats = feats.mean(dim=1)
         out_all.append(feats.detach().float().cpu().numpy())
     return np.concatenate(out_all, axis=0)
 
@@ -347,7 +372,8 @@ class SigLIPBackend(ImageBackend):
                 if hasattr(self.model, "get_image_features"):
                     out = self.model.get_image_features(**inputs)
                 else:
-                    out = self.model(**inputs).pooler_output
+                    out = self.model(**inputs)
+                out = _extract_tensor(out)
             emb = out.detach().float().cpu().numpy()
             if emb.ndim == 3:
                 emb = emb.mean(axis=1)
