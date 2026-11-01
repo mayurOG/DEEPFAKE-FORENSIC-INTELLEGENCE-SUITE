@@ -149,6 +149,36 @@ def chrom_pulse(rgb: np.ndarray, fps: float) -> np.ndarray:
     return xf - alpha * yf
 
 
+def pos_pulse(rgb: np.ndarray, fps: float, window_s: float = 1.6) -> np.ndarray:
+    """POS (Plane-Orthogonal-to-Skin) rPPG — Wang et al. 2017.
+
+    Better noise rejection than CHROM in non-controlled lighting because it
+    uses a sliding-window skin-tone projection rather than a global mean.
+    Fused with CHROM in dual-rPPG mode for improved SNR.
+    """
+    from scipy.signal import butter, filtfilt
+
+    rgb = np.stack([_interp_nan(rgb[:, c]) for c in range(3)], axis=1)
+    N = len(rgb)
+    win = max(2, int(window_s * fps))
+    H = np.zeros(N)
+    for n in range(win, N):
+        Cn = rgb[n - win:n].copy()
+        mu = Cn.mean(axis=0, keepdims=True) + 1e-9
+        Cn = Cn / mu
+        # Skin-orthogonal projection.
+        S1 = Cn[:, 0] - Cn[:, 1]          # R - G
+        S2 = Cn[:, 0] + Cn[:, 1] - 2 * Cn[:, 2]  # R + G - 2B
+        alpha_w = np.std(S1) / (np.std(S2) + 1e-9)
+        H[n - win:n] += S1 - alpha_w * S2
+    # Band-pass 0.7–3.0 Hz.
+    nyq = fps / 2.0
+    hi = min(3.0, nyq * 0.95)
+    b, a = butter(3, [0.7 / nyq, hi / nyq], btype="band")
+    H = filtfilt(b, a, H)
+    return H
+
+
 def pulse_snr(signal: np.ndarray, fps: float) -> Tuple[float, float]:
     """(heart rate in bpm, SNR in dB) of the dominant in-band frequency."""
     n = len(signal)
@@ -166,7 +196,15 @@ def pulse_snr(signal: np.ndarray, fps: float) -> Tuple[float, float]:
     return float(60.0 * f0), float(10 * np.log10(p_sig / p_noise + 1e-12))
 
 
-def rppg_evidence(sig: Optional[FaceSignals], compression: str = "low") -> Evidence:
+def rppg_evidence(
+    sig: Optional[FaceSignals], compression: str = "low", dual: bool = False,
+) -> Evidence:
+    """rPPG evidence from physiological pulse signal.
+
+    v4.0: dual=True enables CHROM+POS fusion for better noise rejection.
+    The POS signal is computed over a sliding window (better under illumination
+    variation), then the two signals are averaged after normalisation.
+    """
     if sig is None:
         return skipped("rppg", "no usable face track", True)
     if sig.fps < 15:
@@ -179,16 +217,43 @@ def rppg_evidence(sig: Optional[FaceSignals], compression: str = "low") -> Evide
         return skipped("rppg", "face too small for colour analysis", True)
     if compression == "high":
         return skipped("rppg", "video too compressed to carry a pulse", True)
+
     rgb = (sig.forehead_rgb + sig.cheek_rgb) / 2.0
-    pulse = chrom_pulse(rgb, sig.fps)
-    hr, snr = pulse_snr(pulse, sig.fps)
+
+    # CHROM signal (always computed).
+    pulse_chrom = chrom_pulse(rgb, sig.fps)
+    hr_chrom, snr_chrom = pulse_snr(pulse_chrom, sig.fps)
+
+    if dual:
+        # POS signal for dual rPPG fusion.
+        try:
+            pulse_pos = pos_pulse(rgb, sig.fps)
+            hr_pos, snr_pos = pulse_snr(pulse_pos, sig.fps)
+            # Fuse by SNR-weighted average (better SNR → higher weight).
+            w_c = max(snr_chrom, 1e-9)
+            w_p = max(snr_pos, 1e-9)
+            w_total = w_c + w_p
+            pulse_fused = (w_c / w_total) * pulse_chrom + (w_p / w_total) * pulse_pos
+            hr, snr = pulse_snr(pulse_fused, sig.fps)
+            method = "chrom+pos_dual"
+        except Exception:
+            hr, snr = hr_chrom, snr_chrom
+            method = "chrom_only"
+    else:
+        hr, snr = hr_chrom, snr_chrom
+        method = "chrom"
+
     # A clean periodic pulse (high SNR) is a sign of a live face.
     logit = float(np.clip((0.0 - snr) * 0.35, -3.0, 3.0))
     rel = 0.5 if compression == "low" else 0.3
     return Evidence(
         name="rppg", logit=logit, reliability=rel, heuristic=True,
-        detail={"hr_bpm": round(hr, 1), "snr_db": round(snr, 2),
-                "seconds": round(sig.n_frames / sig.fps, 1)},
+        detail={
+            "hr_bpm": round(hr, 1),
+            "snr_db": round(snr, 2),
+            "seconds": round(sig.n_frames / sig.fps, 1),
+            "method": method,
+        },
     )
 
 

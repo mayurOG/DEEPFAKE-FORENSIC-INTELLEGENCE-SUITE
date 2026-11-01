@@ -51,6 +51,11 @@ from detector.experts.facesignals import (
 )
 from detector.experts.spectral import load_head as load_spectral_head, spectral_evidence
 from detector.experts.tamper import tamper_evidence, tamper_heatmap_image
+try:
+    from detector.experts.optical_flow import optical_flow_evidence as _optical_flow_evidence
+    _HAS_OPTICAL_FLOW = True
+except ImportError:
+    _HAS_OPTICAL_FLOW = False
 from detector.experts.temporal import (
     aggregate_frame_logits, load_temporal_head, temporal_evidence,
 )
@@ -378,26 +383,39 @@ class Pipeline:
         return fr.logit, info
 
     def _image_registry(self, img, quality: QualityProfile, backends) -> List[TestSpec]:
-        # Recommended image experts: DINOv2/3 probe + SigLIP (via backends),
-        # frequency/spectral, Face X-ray style tamper, localization.
+        # v4.0: expanded registry — includes diffusion detector and upgraded spectral/NPR.
         comp = {"low": 0.9, "medium": 0.6, "high": 0.3}.get(quality.compression, 0.6)
         va = None if self.spectral_head is None else float(self.spectral_head.get("val_auc", 0.5))
+        has_npr = bool(self.spectral_head and self.spectral_head.get("has_npr", False))
         big = min(img.size) >= 96
         has_siglip = any(getattr(b, "kind", "") == "siglip" for b in backends)
+        has_diffusion = any(getattr(b, "kind", "") == "diffusion_classifier" for b in backends)
         return [
-            TestSpec("spectral", 0.05,
-                     lambda c: comp * float(np.clip(((va or 0.5) - 0.5) * 2, 0, 1)),
-                     lambda c: self.spectral_head is not None and big,
-                     "no trained spectral head" if self.spectral_head is None
-                     else "image too small"),
+            # 1. Real NPR + spectral frequency expert (upgraded from stub to real).
+            TestSpec(
+                "spectral", 0.05,
+                lambda c: comp * float(np.clip(((va or 0.5) - 0.5) * 2, 0, 1)),
+                lambda c: self.spectral_head is not None and big,
+                f"no trained {'NPR+spectral' if has_npr else 'spectral'} head"
+                if self.spectral_head is None else "image too small",
+            ),
+            # 2. Lightweight forensic prior.
             TestSpec("forensic_prior", 0.1, lambda c: 0.5, heuristic=True),
+            # 3. Noise inconsistency (tamper detection).
             TestSpec("tamper", 0.4, lambda c: comp, lambda c: big,
                      "image too small", heuristic=True),
+            # 4. Second backbone / probe (DINOv2-Large or other).
             TestSpec("neural_probe", 0.5, lambda c: quality.neural_reliability(),
                      lambda c: len(backends) > 1, "no second backbone configured"),
+            # 5. SigLIP-SO400M semantic branch (NEW v4.0 at 400M/384px).
             TestSpec("siglip_semantic", 0.35,
                      lambda c: quality.neural_reliability() * 0.8,
-                     lambda c: has_siglip, "SigLIP branch not configured"),
+                     lambda c: has_siglip, "SigLIP-SO400M branch not configured"),
+            # 6. Diffusion-specific detector (NEW v4.0 — SDXL / DALL-E / Flux).
+            TestSpec("diffusion_detect", 0.45,
+                     lambda c: quality.neural_reliability() * 0.9,
+                     lambda c: has_diffusion, "diffusion detector not configured"),
+            # 7. Localization heatmap.
             TestSpec("localization", 0.6,
                      lambda c: 0.5 if big else 0.2,
                      lambda c: bool(getattr(self.settings, "localization", True)) and big,
@@ -407,34 +425,51 @@ class Pipeline:
     def _image_test(self, name, img, crops, backends, quality, face_box) -> Evidence:
         if name == "neural_probe":
             zs = [aggregate_faces(b.predict(crops)[0]) for b in backends[1:]
-                  if getattr(b, "kind", "") not in ("siglip", "frequency")]
+                  if getattr(b, "kind", "") not in ("siglip", "frequency", "diffusion_classifier")]
             if not zs:
                 zs = [0.0]
-            return Evidence("neural_probe", float(np.mean(zs)), quality.neural_reliability(),
-                            detail={"backends": [b.name for b in backends[1:]
-                                                if getattr(b, "kind", "") not in ("siglip", "frequency")]})
+            return Evidence(
+                "neural_probe", float(np.mean(zs)), quality.neural_reliability(),
+                detail={"backends": [b.name for b in backends[1:]
+                                     if getattr(b, "kind", "") not in
+                                     ("siglip", "frequency", "diffusion_classifier")]})
         if name == "siglip_semantic":
             sig = [b for b in backends if getattr(b, "kind", "") == "siglip"]
             if not sig:
-                return skipped("siglip_semantic", "SigLIP not available")
-            # Embedding-only branch: neutral logit, reliability from quality.
-            # Downstream calibration / OOD uses the embedding when present.
+                return skipped("siglip_semantic", "SigLIP-SO400M not available")
             _z, emb = sig[0].predict(crops)
-            return Evidence("siglip_semantic", 0.0, quality.neural_reliability() * 0.7,
-                            detail={"backend": sig[0].name, "emb_dim": int(emb.shape[-1]) if emb is not None else 0})
+            return Evidence(
+                "siglip_semantic", 0.0, quality.neural_reliability() * 0.7,
+                detail={"backend": sig[0].name,
+                        "emb_dim": int(emb.shape[-1]) if emb is not None else 0,
+                        "note": "SO400M/384px semantic consistency embedding"})
+        if name == "diffusion_detect":
+            # NEW v4.0: diffusion-specific detector (SDXL / DALL-E / Flux / Midjourney).
+            diff_backends = [b for b in backends if getattr(b, "kind", "") == "diffusion_classifier"]
+            if not diff_backends:
+                return skipped("diffusion_detect", "diffusion detector not configured")
+            zs = [aggregate_faces(b.predict(crops)[0]) for b in diff_backends]
+            return Evidence(
+                "diffusion_detect", float(np.mean(zs)), quality.neural_reliability() * 0.85,
+                detail={"backends": [b.name for b in diff_backends],
+                        "note": "Specialized for SDXL/DALL-E/Flux/Midjourney outputs"})
         if name == "tamper":
             return tamper_evidence(img, face_box, quality.compression)
         if name == "spectral":
-            return spectral_evidence(img, self.spectral_head, quality.compression)
+            # v4.0: real NPR+spectral expert (not a stub).
+            has_npr = bool(self.spectral_head and self.spectral_head.get("has_npr", False))
+            ev = spectral_evidence(img, self.spectral_head, quality.compression)
+            if ev.detail is None:
+                ev.detail = {}
+            ev.detail["expert_version"] = "NPR+spectral v4.0" if has_npr else "spectral v3.x"
+            return ev
         if name == "localization":
-            # Reuse tamper heatmap as a lightweight localization signal; full
-            # SAM-2 / Face X-ray can replace this when models are available.
             ev = tamper_evidence(img, face_box, quality.compression)
             ev.name = "localization"
             ev.heuristic = True
             if ev.detail is None:
                 ev.detail = {}
-            ev.detail["note"] = "patch-level suspicion map (tamper/Face-X-ray style); SAM-2 optional"
+            ev.detail["note"] = "noise-inconsistency localization; SAM-2 optional upgrade"
             return ev
         return self._forensic_prior(img)
 
@@ -455,7 +490,8 @@ class Pipeline:
             res.abstention_reason = (f"insufficient_evidence (sufficiency {suff:.2f} < {ms:.2f})")
             res.warnings.append("Evidence is not sufficient for a confident call "
                                 "(few or strongly correlated sources).")
-        if media == "image" and self.attribution_head is not None and res.verdict == FAKE:
+        # Generator attribution (image only; also runs for video key frames).
+        if self.attribution_head is not None and res.verdict == FAKE:
             try:
                 from detector.attribution import attribute_image
                 im = res.artifacts.get("source_image")
@@ -465,7 +501,24 @@ class Pipeline:
                 res.attribution = None
         from detector.grounded_explain import build_claims
         res.grounded = {"claims": build_claims(res.to_dict())}
-        res.narrative = build_narrative(res.to_dict())
+        # LLM narrative (optional; falls back to rule-based).
+        s = self.settings
+        llm_text = None
+        try:
+            from detector.llm_narrative import generate_llm_narrative
+            llm_text = generate_llm_narrative(
+                res.to_dict(),
+                provider=s.llm_narrative_provider,
+                model=s.llm_narrative_model,
+                openai_key=s.openai_api_key,
+                gemini_key=s.gemini_api_key,
+            )
+        except Exception:
+            llm_text = None
+        res.narrative = llm_text if llm_text else build_narrative(res.to_dict())
+        if llm_text:
+            res.explanation = res.explanation or {}
+            res.explanation["narrative_source"] = "llm"
         res.audit = build_chain(res.to_dict(), self.settings.artifact_dir, source_size).to_dict()
         return res
 
@@ -842,10 +895,26 @@ class Pipeline:
                     path, M.get_face_detector(), max_seconds=s.face_signal_seconds)
             except Exception as e:
                 log.warning("face signal extraction failed: %s", e)
-            evidence.append(rppg_evidence(sig, quality.compression))
+            evidence.append(rppg_evidence(sig, quality.compression,
+                                          dual=bool(getattr(s, "dual_rppg", True))))
             evidence.append(geometry_evidence(sig))
             evidence.append(sync_evidence(sig, audio_wave, 16000, quality.compression))
-            # 3) extra backbones on the sampled crops
+            # 3) Optical flow inconsistency expert (NEW v4.0).
+            if _HAS_OPTICAL_FLOW and getattr(s, "optical_flow_expert", False):
+                try:
+                    of_ev = _optical_flow_evidence(
+                        path, M.get_face_detector(),
+                        quality_factor=qf,
+                        use_raft=bool(getattr(s, "optical_flow_expert", False)),
+                        device=M.get_device(),
+                    )
+                    evidence.append(of_ev)
+                    log.info("Optical flow expert: logit=%.2f method=%s",
+                             of_ev.logit or 0.0,
+                             (of_ev.detail or {}).get("method", "?"))
+                except Exception as oe:
+                    log.warning("Optical flow expert failed: %s", oe)
+            # 4) extra backbones on the sampled crops
             for b in backends[1:]:
                 zb, _ = b.predict(crops)
                 evidence.append(Evidence("neural_probe", aggregate_frame_logits(zb),

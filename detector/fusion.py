@@ -24,16 +24,18 @@ from detector.calibration import sigmoid
 # artifacts/fusion_weights.json exists (see train/fit_fusion.py).
 DEFAULT_WEIGHTS: Dict[str, float] = {
     "neural": 1.0,
-    "neural_probe": 1.0,
-    "siglip_semantic": 0.6,
+    "neural_probe": 1.0,       # DINOv2-Large probe (v4.0 upgrade)
+    "siglip_semantic": 0.6,    # SigLIP-SO400M-384 (v4.0 upgrade)
+    "diffusion_detect": 0.9,   # NEW v4.0: dedicated diffusion detector
     "temporal": 0.8,
     "audio": 1.0,
     "sync": 0.35,
     "rppg": 0.25,
     "geometry": 0.20,
-    "spectral": 0.50,
+    "spectral": 0.55,          # Upgraded: real NPR+spectral (v4.0)
+    "optical_flow": 0.40,      # NEW v4.0: optical flow inconsistency (video)
     "tamper": 0.30,
-    "localization": 0.0,  # heatmap detail only; logit is a duplicate of tamper
+    "localization": 0.0,       # heatmap detail only
     "forensic_prior": 0.15,
     "metadata_ai": 1.0,
 }
