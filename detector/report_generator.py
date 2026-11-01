@@ -24,7 +24,7 @@ from jinja2 import Environment
 from detector.config import get_settings
 from detector.fusion import _jsonable
 
-SYSTEM_NAME = "Deepfake Forensic Intelligence Suite v3.0"
+SYSTEM_NAME = "Deepfake Forensic Intelligence Suite v4.0"
 
 HTML_REPORT_TEMPLATE = """
 <!DOCTYPE html>
@@ -56,6 +56,10 @@ HTML_REPORT_TEMPLATE = """
   {% if r.confidence is not none %} | Confidence in verdict: {{ "%.1f"|format(r.confidence*100) }}%{% endif %}</div>
  <div class="n">Label set: {{ r.label_set|join(", ") or "none" }} | mode: {{ r.mode }} | path: {{ r.tier }}
   | calibrated: {{ "yes (n=" ~ r.calibrator.n_cal ~ ", alpha=" ~ r.calibrator.alpha ~ ")" if r.calibrated else "NO" }}</div>
+ {% if r.attribution and r.attribution.family %}
+ <div style="margin-top:10px;background:rgba(99,102,241,0.15);border:1px solid rgba(99,102,241,0.35);border-radius:20px;display:inline-block;padding:5px 14px;font-size:0.9rem;color:#a5b4fc">
+  🔬 Generator attribution: <b>{{ r.attribution.family }}</b> ({{ "%.0f"|format(r.attribution.probability*100) }}% confidence) — {{ r.attribution.description }}</div>
+ {% endif %}
 </div>
 
 {% if r.warnings %}<div>{% for w in r.warnings %}<span class="w">{{ w }}</span>{% endfor %}</div>{% endif %}

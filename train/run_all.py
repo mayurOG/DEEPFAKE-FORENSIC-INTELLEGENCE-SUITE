@@ -4,7 +4,15 @@
         --train data/ffpp data/dfdc_sample \
         --calib data/calib \
         --test  data/celebdf data/wilddeepfake \
-        --encoder facebook/dinov2-base \
+        --encoder facebook/dinov2-large \
+        --out artifacts
+
+    # With generator attribution training:
+    python -m train.run_all \
+        --train data/ffpp data/dfdc_sample \
+        --calib data/calib \
+        --encoder facebook/dinov2-large \
+        --attribution-data data/ffpp/fake:GAN data/sd_v15:Diffusion data/dfl:Face_Swap \
         --out artifacts
 
 Folder layout for every dataset: ``<dir>/real/...`` and ``<dir>/fake/...``.
@@ -58,7 +66,14 @@ def main(argv=None):
                     help="also run LayerNorm-only tuning (GPU recommended)")
     ap.add_argument("--batch-size", type=int, default=4,
                     help="encoder images per batch (use 1-2 on GPUs with <=4 GB VRAM)")
+    ap.add_argument("--no-npr", action="store_true",
+                    help="disable NPR features in spectral head (spectral-only ablation)")
+    ap.add_argument("--attribution-data", nargs="*", default=[],
+                    help="path:label pairs for generator attribution training. "
+                         "Example: data/sd:Diffusion data/ffpp:GAN")
     ap.add_argument("--no-faces", action="store_true")
+    ap.add_argument("--epochs", type=int, default=3,
+                    help="epochs for finetuning (LayerNorm tuning)")
     ap.add_argument("--max-items", type=int, default=None)
     ap.add_argument("--mode", default="balanced", choices=["strict", "balanced", "sensitive"])
     a = ap.parse_args(argv)
@@ -107,7 +122,7 @@ def main(argv=None):
         from train import finetune_ln
         _step("finetune_ln", summary, lambda: finetune_ln.main(
             ["--data", a.train[0], "--encoder", a.encoder, "--out", a.out,
-             "--batch-size", str(a.batch_size)] + nf + mx) or {})
+             "--batch-size", str(a.batch_size), "--epochs", str(a.epochs)] + nf + mx) or {})
     spec_args = sum([["--data", d] for d in a.train], [])
     _step("spectral_head", summary, lambda: {"val_auc": train_spectral.main(
         spec_args + ["--out", a.out] + mx)["val_auc"]})
@@ -121,7 +136,11 @@ def main(argv=None):
             return train_audio.main(args) or {}
         _step("audio_probe", summary, do_audio)
 
-    os.environ["EMBED_MODEL_ID"] = a.encoder  # probe becomes the Tier-1 backbone
+    tuned_enc = os.path.join(a.out, "finetuned_encoder")
+    if a.finetune and os.path.isdir(tuned_enc):
+        os.environ["EMBED_MODEL_ID"] = tuned_enc
+    else:
+        os.environ["EMBED_MODEL_ID"] = a.encoder  # probe becomes the Tier-1 backbone
     from detector import models as M
     from detector.pipeline import reset_pipeline
     reset_pipeline()
