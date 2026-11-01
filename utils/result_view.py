@@ -344,6 +344,27 @@ def render_result(res_dict: dict, artifacts: dict, key: str = "r"):
     # ── Cryptographic Provenance Badge ─────────────────────────────────────
     _render_provenance_badge(res_dict.get("provenance"))
 
+    # ── Inference Resource & Cache Status ──────────────────────────────────
+    res_usage = res_dict.get("resource_usage") or {}
+    if res_usage:
+        lat = res_usage.get("latency_ms", 0.0)
+        peak_mb = res_usage.get("peak_memory_mb", 0.0)
+        dev = res_usage.get("device", "cpu")
+        hit = res_usage.get("cache_hit", False)
+        badge_color = "#10b981" if hit else "#38bdf8"
+        hit_label = "⚡ Cache Hit" if hit else "⏱️ Fresh Inference"
+        st.markdown(
+            f"""
+            <div style="background: rgba(15, 23, 42, 0.6); border: 1px solid rgba(56, 189, 248, 0.2);
+                        border-radius: 8px; padding: 6px 14px; margin-bottom: 12px; display: flex;
+                        justify-content: space-between; align-items: center; font-size: 0.8rem; color: #94a3b8;">
+                <div><span style="color: {badge_color}; font-weight: 700;">{hit_label}</span> · Latency: <b style="color: #f1f5f9;">{lat:.1f} ms</b></div>
+                <div>Peak RAM: <b style="color: #f1f5f9;">{peak_mb:.1f} MB</b> · Device: <span style="color: #38bdf8;">{dev}</span></div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
     # ── Top metrics row ───────────────────────────────────────────────────
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Verdict", res_dict["verdict"])

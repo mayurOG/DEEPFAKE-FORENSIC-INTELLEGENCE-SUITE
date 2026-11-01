@@ -441,6 +441,18 @@ with st.sidebar:
         st.warning(f"Status check failed: {e}")
 
     st.markdown("---")
+    st.markdown("### ⚡ Inference Cache & Memory")
+    from detector.cache import get_inference_cache
+    inf_cache = get_inference_cache()
+    c_stats = inf_cache.stats()
+    c_col1, c_col2 = st.columns(2)
+    c_col1.metric("Cached", f"{c_stats['size']} items")
+    c_col2.metric("Hit Ratio", f"{c_stats['hit_ratio']*100:.0f}%")
+    if st.button("🧹 Clear Inference Cache", use_container_width=True):
+        inf_cache.clear()
+        st.toast("Inference cache cleared!", icon="🧹")
+
+    st.markdown("---")
     st.markdown("### ℹ️ v4.0 New Experts")
     st.markdown(
         "<div style='font-size:0.78rem; color:#64748b; line-height:1.7;'>"

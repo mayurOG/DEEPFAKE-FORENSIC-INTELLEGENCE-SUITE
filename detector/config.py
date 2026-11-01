@@ -183,6 +183,7 @@ class Settings:
     # -------------------------------------------------------------------------
     enable_pdf_export: bool = field(default_factory=lambda: _bool("ENABLE_PDF_EXPORT", True))
     show_model_status: bool = field(default_factory=lambda: _bool("SHOW_MODEL_STATUS", True))
+    enable_inference_cache: bool = field(default_factory=lambda: _bool("ENABLE_INFERENCE_CACHE", False))
 
 
 def get_settings() -> Settings:

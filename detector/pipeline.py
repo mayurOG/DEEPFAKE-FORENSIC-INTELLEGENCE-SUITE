@@ -134,6 +134,7 @@ class AnalysisResult:
     timings: Dict[str, float] = field(default_factory=dict)
     backends: List[str] = field(default_factory=list)
     narrative: str = ""
+    resource_usage: Dict[str, Any] = field(default_factory=dict)
     # Not serialised: PIL images etc. for the UI, and raw scores for fitting.
     artifacts: Dict[str, Any] = field(default_factory=dict, repr=False)
     raw: Dict[str, Any] = field(default_factory=dict, repr=False)
@@ -603,6 +604,19 @@ class Pipeline:
     ) -> AnalysisResult:
         if mode not in VALID_MODES:
             raise ValueError(f"mode must be one of {VALID_MODES}")
+        from detector.cache import get_inference_cache, ResourceTracker, compute_content_hash
+        cache = get_inference_cache()
+        content_hash = compute_content_hash(source)
+        if self.settings.enable_inference_cache and not force_full:
+            cached_res = cache.get(content_hash, mode=mode, explain=explain, stability=stability)
+            if cached_res is not None:
+                import copy
+                cached_copy = copy.copy(cached_res)
+                cached_copy.resource_usage = dict(cached_res.resource_usage)
+                cached_copy.resource_usage["cache_hit"] = True
+                cached_copy.resource_usage["latency_ms"] = 0.5
+                return cached_copy
+
         tmp_path = None
         try:
             if hasattr(source, "read"):  # Streamlit UploadedFile / file object
@@ -641,15 +655,22 @@ class Pipeline:
                 enforce_path_limits(source, media_type)
             size = (os.path.getsize(source) if isinstance(source, str) and os.path.isfile(source)
                     else None)
-            if media_type == "image":
-                res = self._analyze_image(source, filename, mode, explain, stability, force_full)
-            elif media_type == "video":
-                res = self._analyze_video(source, filename, mode, explain, stability, force_full)
-            elif media_type == "audio":
-                res = self._analyze_audio(source, filename, mode, explain, audio_chunk_s)
-            else:
-                raise ValueError(f"Unsupported media type {media_type}")
-            return self._post(res, media_type, size)
+
+            with ResourceTracker() as tracker:
+                if media_type == "image":
+                    res = self._analyze_image(source, filename, mode, explain, stability, force_full)
+                elif media_type == "video":
+                    res = self._analyze_video(source, filename, mode, explain, stability, force_full)
+                elif media_type == "audio":
+                    res = self._analyze_audio(source, filename, mode, explain, audio_chunk_s)
+                else:
+                    raise ValueError(f"Unsupported media type {media_type}")
+                final_res = self._post(res, media_type, size)
+
+            final_res.resource_usage = tracker.usage.to_dict()
+            if self.settings.enable_inference_cache and content_hash:
+                cache.put(content_hash, final_res, mode=mode, explain=explain, stability=stability)
+            return final_res
         finally:
             if tmp_path and os.path.exists(tmp_path):
                 try:
