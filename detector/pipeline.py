@@ -156,11 +156,51 @@ def aggregate_faces(logits: np.ndarray) -> float:
     return float(0.5 * z.max() + 0.5 * z.mean())
 
 
-def sample_frames(path: str, n: int) -> List[Tuple[int, float, Image.Image]]:
-    """``n`` evenly spaced frames as (index, seconds, PIL image).
+def _frame_diff(fr1: np.ndarray, fr2: np.ndarray) -> float:
+    """Mean absolute difference between two frames on a normalized [0, 1] scale."""
+    if fr1.shape != fr2.shape:
+        return 1.0
+    return float(np.mean(np.abs(fr1.astype(np.float32) - fr2.astype(np.float32))) / 255.0)
 
-    ``n`` is capped by ``DEEPFAKE_MAX_VIDEO_FRAMES`` so callers cannot request
-    unbounded decoding.
+
+def detect_scene_boundaries(cap, total_frames: int, fps: float, max_probes: int = 50, threshold: float = 0.28) -> List[int]:
+    """Detects scene cut frame indices using lightweight thumbnail probing."""
+    import cv2
+
+    if total_frames < 20:
+        return [0, total_frames]
+
+    step = max(3, total_frames // max_probes)
+    probe_indices = list(range(0, total_frames, step))
+    if probe_indices[-1] != total_frames - 1:
+        probe_indices.append(total_frames - 1)
+
+    boundaries = [0]
+    prev_thumb = None
+    for idx in probe_indices:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, int(idx))
+        ok, fr = cap.read()
+        if not ok or fr is None:
+            continue
+        thumb = cv2.resize(cv2.cvtColor(fr, cv2.COLOR_BGR2GRAY), (48, 48))
+        if prev_thumb is not None:
+            diff = _frame_diff(thumb, prev_thumb)
+            if diff > threshold:
+                boundaries.append(int(idx))
+        prev_thumb = thumb
+
+    if boundaries[-1] != total_frames:
+        boundaries.append(int(total_frames))
+    return boundaries
+
+
+def sample_frames(path: str, n: int, detect_scenes: bool = True, skip_duplicates: bool = True) -> List[Tuple[int, float, Image.Image]]:
+    """``n`` intelligently sampled frames as (index, seconds, PIL image).
+
+    Applies scene-change detection to ensure cross-scene representation, and skips
+    near-identical duplicate frames (e.g. frozen slides, repeated loops) to maximize
+    information diversity.
+    ``n`` is capped by ``DEEPFAKE_MAX_VIDEO_FRAMES``.
     """
     import cv2
     from detector.config import get_settings
@@ -176,15 +216,46 @@ def sample_frames(path: str, n: int) -> List[Tuple[int, float, Image.Image]]:
         fps = 30.0
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
     out: List[Tuple[int, float, Image.Image]] = []
+
     if total > 0:
-        idxs = np.unique(np.linspace(0, total - 1, n + 2)[1:-1].astype(int))
+        # Determine candidate indices: scene-aware or uniform
+        if detect_scenes and total >= 30:
+            boundaries = detect_scene_boundaries(cap, total, fps)
+            if len(boundaries) > 2:
+                # Distribute sample budget across detected scenes
+                candidate_idxs = []
+                for b_start, b_end in zip(boundaries[:-1], boundaries[1:]):
+                    scene_len = b_end - b_start
+                    if scene_len <= 0:
+                        continue
+                    n_scene = max(1, int(round(n * (scene_len / total))))
+                    s_pts = np.linspace(b_start, b_end - 1, n_scene + 2)[1:-1].astype(int)
+                    candidate_idxs.extend(s_pts.tolist())
+                idxs = np.unique(candidate_idxs)
+                # If budget exceeded, subsample evenly
+                if len(idxs) > n:
+                    idxs = idxs[np.linspace(0, len(idxs) - 1, n).astype(int)]
+            else:
+                idxs = np.unique(np.linspace(0, total - 1, n + 2)[1:-1].astype(int))
+        else:
+            idxs = np.unique(np.linspace(0, total - 1, n + 2)[1:-1].astype(int))
+
+        prev_thumb = None
         for i in idxs:
             cap.set(cv2.CAP_PROP_POS_FRAMES, int(i))
             ok, fr = cap.read()
             if ok and fr is not None:
+                thumb = cv2.resize(cv2.cvtColor(fr, cv2.COLOR_BGR2GRAY), (48, 48))
+                # Skip duplicate frame if it's near-identical to previous accepted frame
+                if skip_duplicates and prev_thumb is not None and len(out) < n:
+                    diff = _frame_diff(thumb, prev_thumb)
+                    if diff < 0.010:  # < 1% difference: static duplicate
+                        continue
+                prev_thumb = thumb
                 out.append((int(i), float(i / fps),
                             Image.fromarray(cv2.cvtColor(fr, cv2.COLOR_BGR2RGB))))
-    if len(out) < max(2, n // 2):  # seeking unreliable: sequential fallback
+
+    if len(out) < max(2, n // 2):  # seeking unreliable or heavy duplicates: sequential fallback
         cap.release()
         cap = cv2.VideoCapture(path)
         frames = []
@@ -201,6 +272,7 @@ def sample_frames(path: str, n: int) -> List[Tuple[int, float, Image.Image]]:
                             Image.fromarray(cv2.cvtColor(frames[i], cv2.COLOR_BGR2RGB))))
     cap.release()
     return out
+
 
 
 def frames_at(path: str, times: Sequence[float]) -> List[Tuple[int, float, Image.Image]]:
@@ -1014,19 +1086,67 @@ class Pipeline:
         return chunks, spans
 
     def _audio_evidence(self, wave: np.ndarray, chunk_s: int):
+        from detector.audio_io import compute_vad_mask
+
         sr = 16000
         backend = M.get_audio_backend()
         chunks, spans = self._chunks(wave, sr, chunk_s)
         z, emb = backend.predict(chunks, sr)
         aq = audio_quality(wave, sr)
         rel = aq.neural_reliability()
-        ev = Evidence("audio", aggregate_frame_logits(z), rel,
+
+        # Run Voice Activity Detection (VAD)
+        vad_info = compute_vad_mask(wave, sr)
+        speech_ratio = float(vad_info["speech_ratio"])
+        vad_mask = vad_info["vad_mask"]
+
+        # Calculate speech fraction per chunk
+        chunk_speech_ratios = []
+        for a, b in spans:
+            s_idx = int(a * sr)
+            e_idx = min(len(vad_mask), int(b * sr))
+            c_sr = float(np.mean(vad_mask[s_idx:e_idx])) if e_idx > s_idx else 0.0
+            chunk_speech_ratios.append(c_sr)
+
+        # Silence / ambient noise gating:
+        # If the entire audio file lacks speech (< 3%), voice deepfake predictions on pure noise
+        # produce arbitrary false positives. Downweight to neutral prior.
+        if speech_ratio < 0.03:
+            ev = Evidence(
+                "audio", 0.0, 0.05,
+                detail={"backend": backend.name, "chunks": len(chunks),
+                        "speech_detected": False, "speech_ratio": round(speech_ratio, 3),
+                        "mean_snr_db": round(float(vad_info.get("mean_snr_db", 0.0)), 2)},
+                reason="No active speech detected; audio track is silence or ambient noise.",
+                heuristic=True,
+            )
+            segs = [{"start": float(a), "end": float(b), "logit": 0.0,
+                     "speech_ratio": round(csr, 3), "is_speech": False}
+                    for (a, b), csr in zip(spans, chunk_speech_ratios)]
+            return ev, {"segments": segs, "logits": np.zeros(len(chunks)), "emb": emb,
+                        "spans": spans, "quality": aq, "chunks": chunks, "vad": vad_info}
+
+        # Filter: only evaluate active speech chunks
+        active_indices = [i for i, csr in enumerate(chunk_speech_ratios) if csr >= 0.1]
+        if active_indices:
+            agg_z = aggregate_frame_logits(z[active_indices])
+        else:
+            agg_z = aggregate_frame_logits(z)
+
+        # Scale reliability based on speech presence
+        scaled_rel = rel * min(1.0, max(0.2, speech_ratio / 0.25))
+
+        ev = Evidence("audio", agg_z, scaled_rel,
                       detail={"backend": backend.name, "chunks": len(chunks),
-                              "max_chunk_logit": float(np.max(z))})
-        segs = [{"start": float(a), "end": float(b), "logit": float(zz)}
-                for (a, b), zz in zip(spans, z)]
+                              "max_chunk_logit": float(np.max(z)),
+                              "speech_ratio": round(speech_ratio, 3),
+                              "active_speech_chunks": len(active_indices),
+                              "mean_snr_db": round(float(vad_info.get("mean_snr_db", 0.0)), 2)})
+        segs = [{"start": float(a), "end": float(b), "logit": float(zz),
+                 "speech_ratio": round(csr, 3), "is_speech": bool(csr >= 0.1)}
+                for (a, b), zz, csr in zip(spans, z, chunk_speech_ratios)]
         return ev, {"segments": segs, "logits": z, "emb": emb, "spans": spans,
-                    "quality": aq, "chunks": chunks}
+                    "quality": aq, "chunks": chunks, "vad": vad_info}
 
     def _analyze_audio(self, path, filename, mode, explain, chunk_s):
         t_all = time.time()
@@ -1051,6 +1171,13 @@ class Pipeline:
                         "embedding": mean_emb})
         res.evidence = [e.to_dict() for e in evidence]
         self._finalise(res, cal, p, label_set, verdict, ood_flag, ratio, reason, mode, res.tier)
+
+        if info.get("vad", {}).get("speech_ratio", 1.0) < 0.05:
+            res.warnings.append(
+                f"No active speech detected in audio track (speech ratio: {info['vad']['speech_ratio'] * 100:.1f}%). "
+                "The track appears to be silence or ambient noise; voice deepfake detection requires voiced speech."
+            )
+
         for seg, zz in zip(info["segments"], info["logits"]):
             pp = float(cal.prob_fake(zz))
             res.timeline.append({"timestamp": round((seg["start"] + seg["end"]) / 2, 3),
@@ -1066,6 +1193,7 @@ class Pipeline:
         res.narrative = build_narrative(res.to_dict())
         res.timings["total"] = time.time() - t_all
         return res
+
 
 
 _PIPELINE: Optional[Pipeline] = None

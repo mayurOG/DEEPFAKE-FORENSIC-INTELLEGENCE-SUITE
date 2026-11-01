@@ -56,10 +56,38 @@ def run(calib_items, test_items, media, mode, alpha, risk_target, budgets, n_boo
             continue
         pa = np.array([x["p"] for x in r["_rows"]])
         pb = np.array([x["p"] for x in base])
+        # Accuracy & False-Positive Rate vs computation budget
+        acc = float(np.mean([(p >= 0.5) == y for p, y in zip(pa, yb)]))
+        neg_mask = (yb == 0)
+        fpr = float(np.mean(pa[neg_mask] >= 0.5)) if np.any(neg_mask) else 0.0
+
+        # Percentage of cases where adaptive routing matches or beats full inference
+        matches_or_beats = float(np.mean([
+            abs(p_a - y) <= abs(p_b - y) + 1e-6
+            for p_a, p_b, y in zip(pa, pb, yb)
+        ]))
+
+        # Early-exit error rate (cases that exited with <= 1 call)
+        early_items = [x for x in r["_rows"] if x.get("calls", 0) <= 1]
+        early_exit_error_rate = (
+            float(np.mean([(x["p"] >= 0.5) != x["y"] for x in early_items]))
+            if early_items else 0.0
+        )
+
+        r["adaptive_benchmark"] = {
+            "accuracy": acc,
+            "fpr": fpr,
+            "mean_experts_executed": float(r.get("mean_expert_calls", 0.0)),
+            "pct_match_or_beat_full_inference": matches_or_beats,
+            "early_exit_error_rate": early_exit_error_rate,
+            "early_exit_count": len(early_items),
+        }
         r["vs_fixed_cascade"] = {
             "auroc_diff": MT.paired_bootstrap_diff(MT.auc, yb, pa, pb, n_boot=n_boot),
             "expert_calls_diff": r["mean_expert_calls"] - results["fixed_cascade"]["mean_expert_calls"],
-            "latency_median_diff_s": r["latency_median_s"] - results["fixed_cascade"]["latency_median_s"]}
+            "latency_median_diff_s": r["latency_median_s"] - results["fixed_cascade"]["latency_median_s"],
+            "matches_or_beats_full": matches_or_beats,
+        }
     for r in results.values():
         r.pop("_rows", None)
     return results

@@ -57,6 +57,137 @@ def expected_calibration_error(
     return float(ece)
 
 
+def adaptive_ece(
+    y_true: Sequence[int], p_fake: Sequence[float], bins: int = 15
+) -> float:
+    """Adaptive Expected Calibration Error with equal-mass binning."""
+    y = _arr(y_true)
+    p = _arr(p_fake)
+    n = len(p)
+    if n == 0:
+        return 0.0
+    order = np.argsort(p)
+    y, p = y[order], p[order]
+    chunks = np.array_split(np.arange(n), min(bins, n))
+    aece = 0.0
+    for chunk in chunks:
+        if len(chunk) > 0:
+            w = len(chunk) / n
+            aece += w * abs(p[chunk].mean() - y[chunk].mean())
+    return float(aece)
+
+
+def class_wise_ece(
+    y_true: Sequence[int], p_fake: Sequence[float], bins: int = 15
+) -> Dict[str, float]:
+    """Class-wise calibration error evaluated separately for real and fake."""
+    y = _arr(y_true)
+    p = _arr(p_fake)
+    m0 = (y == 0)
+    m1 = (y == 1)
+    ece_real = expected_calibration_error(np.zeros(int(m0.sum())), 1.0 - p[m0], bins=bins) if m0.any() else 0.0
+    ece_fake = expected_calibration_error(np.ones(int(m1.sum())), p[m1], bins=bins) if m1.any() else 0.0
+    return {
+        "ece_real": float(ece_real),
+        "ece_fake": float(ece_fake),
+        "class_wise_mean": float(0.5 * (ece_real + ece_fake)),
+    }
+
+
+def reliability_diagram_data(
+    y_true: Sequence[int], p_fake: Sequence[float], bins: int = 10
+) -> Dict[str, Any]:
+    """Generates calibration curve coordinates (confidence vs empirical accuracy)."""
+    y = _arr(y_true)
+    p = _arr(p_fake)
+    edges = np.linspace(0.0, 1.0, bins + 1)
+    bin_centers = []
+    bin_confs = []
+    bin_accs = []
+    bin_counts = []
+    for lo, hi in zip(edges[:-1], edges[1:]):
+        m = (p > lo) & (p <= hi) if lo > 0 else (p >= lo) & (p <= hi)
+        count = int(m.sum())
+        bin_centers.append(float(0.5 * (lo + hi)))
+        bin_counts.append(count)
+        if count > 0:
+            bin_confs.append(float(p[m].mean()))
+            bin_accs.append(float(y[m].mean()))
+        else:
+            bin_confs.append(float(0.5 * (lo + hi)))
+            bin_accs.append(float("nan"))
+    return {
+        "bin_edges": edges.tolist(),
+        "bin_centers": bin_centers,
+        "confidence": bin_confs,
+        "accuracy": bin_accs,
+        "counts": bin_counts,
+        "ece": expected_calibration_error(y, p, bins=bins),
+        "adaptive_ece": adaptive_ece(y, p, bins=bins),
+        "brier": brier(y, p),
+        "nll": nll(y, p),
+        "class_wise": class_wise_ece(y, p, bins=bins),
+    }
+
+
+def conformal_evaluation_metrics(
+    y_true: Sequence[int],
+    prediction_sets: Sequence[Sequence[str]],
+    condition_tags: Optional[Sequence[str]] = None,
+) -> Dict[str, Any]:
+    """Evaluates empirical coverage, set size, and class-conditional coverage.
+
+    Each prediction set is e.g. ["Real"], ["Fake"], ["Real", "Fake"], or [].
+    """
+    y = _arr(y_true).astype(int)
+    label_map = {0: "Real", 1: "Fake"}
+    covered = []
+    sizes = []
+    singletons = 0
+    empties = 0
+    cov_real = []
+    cov_fake = []
+
+    for yi, s in zip(y, prediction_sets):
+        true_name = label_map[yi]
+        is_cov = true_name in s
+        covered.append(is_cov)
+        sizes.append(len(s))
+        if len(s) == 1:
+            singletons += 1
+        elif len(s) == 0:
+            empties += 1
+        if yi == 0:
+            cov_real.append(is_cov)
+        else:
+            cov_fake.append(is_cov)
+
+    n = max(len(y), 1)
+    out: Dict[str, Any] = {
+        "n": int(len(y)),
+        "empirical_coverage": float(np.mean(covered)) if covered else 0.0,
+        "coverage_real": float(np.mean(cov_real)) if cov_real else 0.0,
+        "coverage_fake": float(np.mean(cov_fake)) if cov_fake else 0.0,
+        "mean_set_size": float(np.mean(sizes)) if sizes else 0.0,
+        "fraction_singleton": float(singletons / n),
+        "fraction_empty": float(empties / n),
+    }
+
+    if condition_tags is not None and len(condition_tags) == len(y):
+        tags = np.asarray(condition_tags)
+        cond_cov = {}
+        for tag in np.unique(tags):
+            mask = (tags == tag)
+            cond_cov[str(tag)] = {
+                "n": int(mask.sum()),
+                "coverage": float(np.mean([covered[i] for i in np.where(mask)[0]])),
+                "mean_set_size": float(np.mean([sizes[i] for i in np.where(mask)[0]])),
+            }
+        out["conditional_by_tag"] = cond_cov
+
+    return out
+
+
 def brier(y_true: Sequence[int], p_fake: Sequence[float]) -> float:
     return float(np.mean((_arr(p_fake) - _arr(y_true)) ** 2))
 

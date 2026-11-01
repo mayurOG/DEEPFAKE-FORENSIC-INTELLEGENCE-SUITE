@@ -62,6 +62,17 @@ def _noise(img: Image.Image, sigma: float, seed: int = 0) -> Image.Image:
     return Image.fromarray(np.clip(a + n, 0, 255).astype(np.uint8))
 
 
+def _motion_blur(img: Image.Image, ksize: int = 5) -> Image.Image:
+    """Horizontal motion blur simulation (camera / object shake)."""
+    import cv2
+    arr = np.asarray(img.convert("RGB"))
+    kernel = np.zeros((ksize, ksize))
+    kernel[int((ksize - 1) / 2), :] = np.ones(ksize)
+    kernel /= ksize
+    blurred = cv2.filter2D(arr, -1, kernel)
+    return Image.fromarray(blurred)
+
+
 @dataclass(frozen=True)
 class Transform:
     name: str
@@ -70,12 +81,20 @@ class Transform:
     # which compression levels of the *input* already include this effect
     already_in: Sequence[str] = ()
 
+    @property
+    def label(self) -> str:
+        return self.name
+
+    def apply(self, x: Any) -> Any:
+        return self.fn(x)
+
     def plausible_given(self, quality: Optional[Dict[str, Any]]) -> bool:
         """Could the input plausibly have been through this already? If so a
         flip is informative about real-world fragility; if the input is a
         clean original, severe transformations are hypothetical."""
         comp = (quality or {}).get("compression", "unknown")
         return self.severity <= 0.5 or comp in self.already_in or comp == "unknown"
+
 
 
 IMAGE_TRANSFORMS: List[Transform] = [
@@ -86,10 +105,107 @@ IMAGE_TRANSFORMS: List[Transform] = [
     Transform("downscale_0.5", 0.50, lambda im: _resize(im, 0.5), ("high",)),
     Transform("blur_1.0", 0.30, lambda im: im.convert("RGB").filter(ImageFilter.GaussianBlur(1.0))),
     Transform("blur_2.0", 0.60, lambda im: im.convert("RGB").filter(ImageFilter.GaussianBlur(2.0)), ("high",)),
+    Transform("motion_blur_5", 0.45, lambda im: _motion_blur(im, 5)),
     Transform("crop_0.9", 0.20, lambda im: _crop(im, 0.9)),
     Transform("noise_4", 0.30, lambda im: _noise(im, 4.0)),
     Transform("social_pipeline", 0.55, lambda im: _jpeg(_resize(im, 0.6), 65), ("high",)),
 ]
+
+
+# Structured, multi-level degradation suites for curve benchmarking
+DEGRADATION_SUITES: Dict[str, List[Transform]] = {
+    "jpeg": [
+        Transform("jpeg_q85", 0.15, lambda im: _jpeg(im, 85)),
+        Transform("jpeg_q65", 0.35, lambda im: _jpeg(im, 65)),
+        Transform("jpeg_q45", 0.55, lambda im: _jpeg(im, 45)),
+        Transform("jpeg_q25", 0.80, lambda im: _jpeg(im, 25)),
+    ],
+    "resolution": [
+        Transform("res_0.85", 0.15, lambda im: _resize(im, 0.85)),
+        Transform("res_0.65", 0.35, lambda im: _resize(im, 0.65)),
+        Transform("res_0.45", 0.55, lambda im: _resize(im, 0.45)),
+        Transform("res_0.25", 0.80, lambda im: _resize(im, 0.25)),
+    ],
+    "downscale": [
+        Transform("res_0.85", 0.15, lambda im: _resize(im, 0.85)),
+        Transform("res_0.65", 0.35, lambda im: _resize(im, 0.65)),
+        Transform("res_0.45", 0.55, lambda im: _resize(im, 0.45)),
+        Transform("res_0.25", 0.80, lambda im: _resize(im, 0.25)),
+    ],
+    "blur": [
+        Transform("blur_g1", 0.25, lambda im: im.convert("RGB").filter(ImageFilter.GaussianBlur(1.0))),
+        Transform("blur_g2", 0.50, lambda im: im.convert("RGB").filter(ImageFilter.GaussianBlur(2.0))),
+        Transform("blur_g4", 0.75, lambda im: im.convert("RGB").filter(ImageFilter.GaussianBlur(4.0))),
+        Transform("blur_motion", 0.45, lambda im: _motion_blur(im, 7)),
+    ],
+    "noise": [
+        Transform("noise_s5", 0.20, lambda im: _noise(im, 5.0)),
+        Transform("noise_s15", 0.50, lambda im: _noise(im, 15.0)),
+        Transform("noise_s30", 0.80, lambda im: _noise(im, 30.0)),
+    ],
+}
+
+
+
+
+def evaluate_degradation_impact(
+    score_fn: Callable[[List[Any]], Sequence[float]],
+    items: Sequence[Any],
+    labels: Sequence[int],
+    suite: Optional[List[Transform]] = None,
+) -> Dict[str, Any]:
+    """Measure how detector performance changes across controlled degradation levels.
+
+    Computes:
+      - Delta AUC = AUC_original - AUC_degraded
+      - Prediction flip rate
+      - Confidence degradation (average shift in confidence)
+      - False-positive increase (Delta FPR on real samples)
+    """
+    from detector.calibration import sigmoid
+    from detector.metrics import auc
+
+    transforms = suite or IMAGE_TRANSFORMS
+    y = np.asarray(labels, dtype=int)
+    base_logits = _as_logits(score_fn, items)
+    base_probs = sigmoid(base_logits)
+    base_auc = auc(y, base_logits)
+    base_preds = (base_probs >= 0.5).astype(int)
+    real_mask = (y == 0)
+    base_fpr = float(np.mean(base_preds[real_mask])) if real_mask.any() else 0.0
+
+    levels_report = []
+    for t in transforms:
+        degraded_items = [t.fn(it) for it in items]
+        deg_logits = _as_logits(score_fn, degraded_items)
+        deg_probs = sigmoid(deg_logits)
+        deg_preds = (deg_probs >= 0.5).astype(int)
+
+        deg_auc = auc(y, deg_logits)
+        d_auc = float(base_auc - deg_auc) if (np.isfinite(base_auc) and np.isfinite(deg_auc)) else 0.0
+        flip_rate = float(np.mean(deg_preds != base_preds))
+        conf_drop = float(np.mean(np.maximum(base_probs, 1 - base_probs) - np.maximum(deg_probs, 1 - deg_probs)))
+        deg_fpr = float(np.mean(deg_preds[real_mask])) if real_mask.any() else 0.0
+        fpr_increase = max(deg_fpr - base_fpr, 0.0)
+
+        levels_report.append({
+            "transform": t.name,
+            "severity": t.severity,
+            "auc": round(float(deg_auc), 4) if np.isfinite(deg_auc) else None,
+            "delta_auc": round(d_auc, 4),
+            "flip_rate": round(flip_rate, 4),
+            "confidence_drop": round(conf_drop, 4),
+            "fpr": round(deg_fpr, 4),
+            "fpr_increase": round(fpr_increase, 4),
+        })
+
+    return {
+        "base_auc": round(float(base_auc), 4) if np.isfinite(base_auc) else None,
+        "base_fpr": round(base_fpr, 4),
+        "levels": levels_report,
+        "max_delta_auc": max(r["delta_auc"] for r in levels_report) if levels_report else 0.0,
+        "max_flip_rate": max(r["flip_rate"] for r in levels_report) if levels_report else 0.0,
+    }
 
 
 def _as_logits(score_fn, items) -> np.ndarray:

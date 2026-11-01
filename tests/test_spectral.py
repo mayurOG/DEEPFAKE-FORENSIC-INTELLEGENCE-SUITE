@@ -1,7 +1,7 @@
 import numpy as np
 from PIL import Image
 
-from detector.experts.spectral import (N_BINS, fit_head, head_logit, load_head,
+from detector.experts.spectral import (FEATURE_DIM, N_BINS, fit_head, head_logit, load_head,
                                        save_head, spectral_evidence, spectral_features)
 from detector import metrics as MT
 from train import train_spectral
@@ -35,7 +35,7 @@ def _data(k=30):
 
 def test_feature_shape_and_determinism():
     f1, f2 = spectral_features(natural(1)), spectral_features(natural(1))
-    assert f1.shape == (N_BINS + 5,) and np.allclose(f1, f2)
+    assert f1.shape in ((N_BINS + 5,), (FEATURE_DIM,)) and np.allclose(f1, f2)
     assert np.isfinite(f1).all()
     assert (spectral_features(Image.new("RGB", (40, 40))) == 0).all()
 

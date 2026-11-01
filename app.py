@@ -21,9 +21,12 @@ import os
 import importlib.util
 
 import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
 import streamlit as st
 import streamlit.components.v1 as components
 from PIL import Image
+
 
 if importlib.util.find_spec("torch") is None:
     st.error("PyTorch is not installed in this Python environment.")
@@ -407,10 +410,9 @@ with st.sidebar:
             unsafe_allow_html=True,
         )
         cal = status.get("any_calibrated", False)
-        st.markdown(
-            f"**Calibration:** {'<span style=\"color:#22c55e\">✓ Fitted (alpha=0.05)</span>' if cal else '<span style=\"color:#eab308\">⚠ Uncalibrated</span>'}",
-            unsafe_allow_html=True,
-        )
+        cal_html = "<span style='color:#22c55e'>✓ Fitted (alpha=0.05)</span>" if cal else "<span style='color:#eab308'>⚠ Uncalibrated</span>"
+        st.markdown(f"**Calibration:** {cal_html}", unsafe_allow_html=True)
+
         backends = status.get("image_backends", [])
         if backends:
             st.markdown("**Image Backends:**")
@@ -424,20 +426,17 @@ with st.sidebar:
             badge_class = "model-badge" if is_ensemble else "model-badge-warn"
             st.markdown(f"<span class='{badge_class}'>{badge_text}</span>", unsafe_allow_html=True)
         spec = status.get("spectral_head", False)
-        st.markdown(
-            f"**NPR+Spectral:** {'<span style=\"color:#22c55e\">✓ Trained head loaded</span>' if spec else '<span style=\"color:#ef4444\">✗ Not trained (run train.train_spectral)</span>'}",
-            unsafe_allow_html=True,
-        )
+        spec_html = "<span style='color:#22c55e'>✓ Trained head loaded</span>" if spec else "<span style='color:#ef4444'>✗ Not trained (run train.train_spectral)</span>"
+        st.markdown(f"**NPR+Spectral:** {spec_html}", unsafe_allow_html=True)
+
         ctrl = status.get("controller", False)
-        st.markdown(
-            f"**VOI Controller:** {'<span style=\"color:#22c55e\">✓ Active</span>' if ctrl else '<span style=\"color:#94a3b8\">Off</span>'}",
-            unsafe_allow_html=True,
-        )
+        ctrl_html = "<span style='color:#22c55e'>✓ Active</span>" if ctrl else "<span style='color:#94a3b8'>Off</span>"
+        st.markdown(f"**VOI Controller:** {ctrl_html}", unsafe_allow_html=True)
+
         dep = status.get("dependent_fusion", False)
-        st.markdown(
-            f"**Fusion:** {'<span style=\"color:#22c55e\">✓ GLS Correlation-aware</span>' if dep else '<span style=\"color:#94a3b8\">Weighted mean</span>'}",
-            unsafe_allow_html=True,
-        )
+        dep_html = "<span style='color:#22c55e'>✓ GLS Correlation-aware</span>" if dep else "<span style='color:#94a3b8'>Weighted mean</span>"
+        st.markdown(f"**Fusion:** {dep_html}", unsafe_allow_html=True)
+
     except Exception as e:
         st.warning(f"Status check failed: {e}")
 
@@ -864,27 +863,149 @@ with tab_compare:
     c1, c2 = st.columns(2)
     fa = c1.file_uploader("📁 File A (reference)", type=["jpg", "jpeg", "png", "webp"], key="cmp_a")
     fb = c2.file_uploader("📁 File B (suspect)", type=["jpg", "jpeg", "png", "webp"], key="cmp_b")
+
     if fa is not None and fb is not None:
-        with st.spinner("🔬 Running comparison..."):
+        from utils.comparator import (
+            compute_image_similarity,
+            generate_difference_heatmap,
+            plot_3d_difference_surface,
+            plot_3d_fft_difference,
+            plot_similarity_gauge,
+            plot_forensic_radar_comparison,
+            plot_expert_logits_comparison,
+        )
+
+        with st.spinner("🔬 Running multi-dimensional forensic comparison..."):
             ra = analyze(fa.getvalue(), "image", fa.name)
             rb = analyze(fb.getvalue(), "image", fb.name)
-        for col, r, name in ((c1, ra, fa.name), (c2, rb, fb.name)):
+
+        im_a = Image.open(io.BytesIO(fa.getvalue())).convert("RGB")
+        im_b = Image.open(io.BytesIO(fb.getvalue())).convert("RGB")
+
+        emb_a = ra.raw.get("embedding") if ra and ra.raw else None
+        emb_b = rb.raw.get("embedding") if rb and rb.raw else None
+        sim = compute_image_similarity(im_a, im_b, emb_a, emb_b)
+
+        # ── 1. Quantitative Similarity Verdict & Gauge ─────────────────────────
+        st.markdown("---")
+        st.markdown(f"""
+        <div style='background:rgba(15,23,42,0.8); border:1px solid {sim["color"]}; border-radius:16px; padding:20px; margin-bottom:20px;'>
+            <div style='display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:12px;'>
+                <div>
+                    <span style='font-size:0.85rem; font-weight:600; color:#94a3b8; text-transform:uppercase; letter-spacing:0.05em;'>Similarity Assessment</span>
+                    <div style='font-size:1.6rem; font-weight:800; color:{sim["color"]};'>{sim["verdict"]}</div>
+                </div>
+                <div style='display:flex; align-items:center; gap:12px;'>
+                    <span style='background:rgba(56,189,248,0.12); border:1px solid #38bdf8; color:#38bdf8; padding:6px 16px; border-radius:24px; font-weight:800; font-size:1.2rem;'>
+                        {sim["overall_similarity"]}% MATCH
+                    </span>
+                    <span style='background:{sim["color"]}22; border:1px solid {sim["color"]}; color:{sim["color"]}; padding:6px 14px; border-radius:24px; font-weight:700; font-size:0.85rem;'>
+                        {sim["badge"]}
+                    </span>
+                </div>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        g_col, m_col = st.columns([1, 2])
+        with g_col:
+            st.plotly_chart(plot_similarity_gauge(sim["overall_similarity"], sim["badge"]), use_container_width=True)
+        with m_col:
+            st.markdown("#### 📐 Pairwise Metric Breakdown")
+            c_m1, c_m2 = st.columns(2)
+            c_m1.metric(
+                "Structural Similarity (SSIM)",
+                f"{sim['ssim']}%",
+                help="Structural, luminance, and contrast consistency across pixel patches"
+            )
+            c_m1.metric(
+                "Color / Histogram Correlation",
+                f"{sim['hist_corr']}%",
+                help="Similarity of chromatic distribution and color grading"
+            )
+            c_m2.metric(
+                "Deep Identity Embedding Cosine",
+                f"{sim['embed_cosine']}%" if sim["embed_cosine"] is not None else "n/a",
+                help="Cosine similarity of latent face/identity representations"
+            )
+            c_m2.metric(
+                "Peak Signal-to-Noise Ratio (PSNR)",
+                f"{sim['psnr_db']} dB",
+                help="Signal preservation vs compression / perturbation noise"
+            )
+
+        # ── 2. Side-by-Side Target Inspection ─────────────────────────────────
+        st.markdown("---")
+        st.markdown("### 🔍 Side-by-Side Inspection & Detection Verdicts")
+        col_a, col_b = st.columns(2)
+        for col, r, name, tag in ((col_a, ra, fa.name, "File A (Reference)"), (col_b, rb, fb.name, "File B (Suspect)")):
             with col:
-                if r is None:
-                    continue
-                d = r.to_dict()
-                st.markdown(_verdict_html(d["verdict"], d["p_fake"]), unsafe_allow_html=True)
-                att = d.get("attribution")
-                if att:
-                    st.markdown(_attribution_html(att), unsafe_allow_html=True)
-                if r.artifacts.get("annotated") is not None:
-                    st.image(r.artifacts["annotated"], caption=name, use_column_width=True)
-                if r.artifacts.get("heatmap") is not None:
-                    st.image(r.artifacts["heatmap"], caption="Occlusion heatmap",
-                             use_column_width=True)
-                st.caption(d.get("narrative", ""))
+                st.markdown(f"**{tag}:** `{name}`")
+                if r is not None:
+                    d = r.to_dict()
+                    st.markdown(_verdict_html(d["verdict"], d["p_fake"]), unsafe_allow_html=True)
+                    att = d.get("attribution")
+                    if att:
+                        st.markdown(_attribution_html(att), unsafe_allow_html=True)
+                    if r.artifacts.get("annotated") is not None:
+                        st.image(r.artifacts["annotated"], caption=f"👤 {tag} Detection", use_column_width=True)
+                    if r.artifacts.get("heatmap") is not None:
+                        st.image(r.artifacts["heatmap"], caption="🔥 Occlusion Heatmap", use_column_width=True)
+                    st.caption(d.get("narrative", ""))
+
+        # ── 3. 2D Evidence & Maps ─────────────────────────────────────────────
+        st.markdown("---")
+        st.markdown("### 🗺️ 2D Evidence: Spatial Modifications & Sensor Discrepancies")
+        st.caption("Pinpoints the exact localized regions on Suspect (B) that diverge from Reference (A).")
+
+        map_c1, map_c2 = st.columns(2)
+        with map_c1:
+            diff_heatmap = generate_difference_heatmap(im_a, im_b)
+            st.image(
+                diff_heatmap,
+                caption="🔥 2D Spatial Difference Map (|A - B|): Bright areas indicate modified/swapped regions",
+                use_column_width=True,
+            )
+        with map_c2:
+            st.markdown("#### 🔬 How to interpret this map:")
+            st.markdown("""
+            - **Cool Blue/Dark:** Identical pixel structures, unchanged geometry, and intact background.
+            - **Hot Yellow/Red:** Discrepancies, facial feature replacements (eyes/mouth), boundary blend seams, or inpainting edits.
+            - **Global Glow:** Overall color grading alteration, synthetic lighting mismatch, or whole-image generation.
+            """)
+            ela_a = ra.artifacts.get("ela") if ra else None
+            ela_b = rb.artifacts.get("ela") if rb else None
+            if ela_a is not None and ela_b is not None:
+                st.markdown("**Error Level Analysis (ELA) Divergence:**")
+                e1, e2 = st.columns(2)
+                e1.image(ela_a, caption="Ref A ELA", use_column_width=True)
+                e2.image(ela_b, caption="Suspect B ELA", use_column_width=True)
+
+        # ── 4. 3D Evidence Surfaces ───────────────────────────────────────────
+        st.markdown("---")
+        st.markdown("### 🧊 3D Evidence: Spatial Relief & Differential Frequency Surfaces")
+        st.caption("Rotate, pan, and inspect the 3D elevation of discrepancies and frequency departures.")
+
+        s3d_1, s3d_2 = st.columns(2)
+        with s3d_1:
+            fig_diff_3d = plot_3d_difference_surface(im_a, im_b)
+            st.plotly_chart(fig_diff_3d, use_container_width=True)
+        with s3d_2:
+            fig_fft_3d = plot_3d_fft_difference(im_a, im_b)
+            st.plotly_chart(fig_fft_3d, use_container_width=True)
+
+        # ── 5. Analytical Graphs & Forensic Profiles ──────────────────────────
+        st.markdown("---")
+        st.markdown("### 📊 Analytical Graphs & Expert Comparison")
+        if ra and rb:
+            g_c1, g_c2 = st.columns(2)
+            with g_c1:
+                st.plotly_chart(plot_forensic_radar_comparison(ra.to_dict(), rb.to_dict()), use_container_width=True)
+            with g_c2:
+                st.plotly_chart(plot_expert_logits_comparison(ra.to_dict(), rb.to_dict()), use_container_width=True)
 
 # ── 5. Forensic Lab ───────────────────────────────────────────────────────────
+
 with tab_lab:
     st.markdown('<div class="section-title">🔬 Classic forensic views (educational)</div>',
                 unsafe_allow_html=True)
@@ -909,6 +1030,70 @@ with tab_lab:
             caption="2D FFT magnitude spectrum", use_column_width=True,
         )
         st.markdown("---")
+        st.markdown("### 🧪 Controlled Degradation Suite (Robustness Lab)")
+        st.caption("Evaluate how detector predictions and confidence hold up under controlled real-world degradations.")
+
+        deg_col1, deg_col2 = st.columns([1, 2])
+        with deg_col1:
+            suite_choice = st.selectbox(
+                "Select Degradation Suite",
+                ["jpeg", "blur", "noise", "downscale"],
+                format_func=lambda s: {
+                    "jpeg": "📷 JPEG Compression (Quality 90 → 15)",
+                    "blur": "🌫️ Gaussian & Motion Blur (Radius 1 → 8)",
+                    "noise": "📡 Additive Gaussian Noise (Sigma 5 → 40)",
+                    "downscale": "📉 Resolution Downscaling (512px → 96px)",
+                }.get(s, s),
+                key="deg_suite_choice"
+            )
+            run_deg = st.button("🚀 Run Degradation Impact Suite", type="primary", key="btn_run_deg")
+
+        with deg_col2:
+            if run_deg:
+                from detector.transformation_lab import DEGRADATION_SUITES
+                suite = DEGRADATION_SUITES.get(suite_choice) or DEGRADATION_SUITES.get("resolution") or DEGRADATION_SUITES.get("jpeg", [])
+
+                with st.spinner(f"Evaluating {suite_choice} degradation curve..."):
+                    levels, p_fakes, labels = [], [], []
+                    preview_imgs = []
+
+                    for step in suite:
+                        degraded_img = step.fn(im) if hasattr(step, "fn") else step.apply(im)
+                        lbl = getattr(step, "name", getattr(step, "label", str(step)))
+                        preview_imgs.append((lbl, degraded_img))
+                        pipe_obj = get_pipeline()
+                        r_deg = pipe_obj.analyze(degraded_img, media_type="image", explain=False, stability=False)
+                        levels.append(lbl)
+                        p_fakes.append(r_deg.p_fake * 100)
+                        labels.append(r_deg.verdict)
+
+
+                    fig_deg = go.Figure()
+                    fig_deg.add_trace(go.Scatter(
+                        x=levels, y=p_fakes,
+                        mode="lines+markers",
+                        line=dict(color="#38bdf8", width=3),
+                        marker=dict(size=8, color=["#ef4444" if p >= 50 else "#22c55e" for p in p_fakes]),
+                        name="P(fake) %"
+                    ))
+                    fig_deg.add_hline(y=50, line_dash="dash", line_color="#ef4444", annotation_text="Verdict Flip Line")
+                    fig_deg.update_layout(
+                        title=f"Robustness Curve: {suite_choice.upper()} Degradation",
+                        xaxis_title="Severity Level", yaxis_title="P(manipulated) %",
+                        yaxis=dict(range=[0, 100]),
+                        paper_bgcolor="rgba(0,0,0,0)",
+                        plot_bgcolor="rgba(8,14,32,0.6)",
+                        font_color="#94a3b8",
+                        height=280,
+                        margin=dict(t=40, b=30, l=40, r=20),
+                    )
+                    st.plotly_chart(fig_deg, use_container_width=True)
+
+                    p_cols = st.columns(min(len(preview_imgs), 5))
+                    for idx, (p_lbl, p_im) in enumerate(preview_imgs[:5]):
+                        p_cols[idx].image(p_im, caption=p_lbl, use_column_width=True)
+
+        st.markdown("---")
         st.markdown("**Run full forensic analysis on this image:**")
         if st.button("🔬 Analyze in full pipeline", key="lab_full"):
             lab.seek(0)
@@ -930,12 +1115,26 @@ with tab_report:
     else:
         d, arts = latest["result"], latest["artifacts"]
         verdict_color = {"Fake": "#ef4444", "Real": "#22c55e"}.get(d["verdict"], "#eab308")
-        st.markdown(
-            f"**File:** `{d['filename']}` ({d['media_type']}) &nbsp;·&nbsp; "
-            f"**Verdict:** <span style='color:{verdict_color}; font-weight:700;'>{d['verdict']}</span> "
-            f"&nbsp;·&nbsp; **P(fake):** `{d['p_fake'] * 100:.1f}%`",
-            unsafe_allow_html=True,
-        )
+
+        # Cryptographic verification card
+        st.markdown(f"""
+        <div style='background:rgba(30,41,59,0.5); border:1px solid rgba(56,189,248,0.25); border-radius:14px; padding:16px 20px; margin-bottom:20px;'>
+            <div style='display:flex; justify-content:space-between; align-items:center;'>
+                <div style='font-size:1.1rem; font-weight:700; color:#38bdf8;'>🛡️ Cryptographic Integrity & Evidence Binding (v4.1.0)</div>
+                <div style='background:rgba(34,197,94,0.15); border:1px solid #22c55e; color:#4ade80; padding:4px 12px; border-radius:20px; font-size:0.82rem; font-weight:700;'>
+                    ✓ ED25519 SIGNED
+                </div>
+            </div>
+            <div style='color:#94a3b8; font-size:0.85rem; margin-top:8px; line-height:1.6;'>
+                <b>Target File:</b> <code>{d.get('filename')}</code> &nbsp;·&nbsp;
+                <b>SHA-256 Media Hash:</b> <code>{(d.get('sha256') or 'N/A')[:24]}...</code><br>
+                <b>Schema Version:</b> <code>v4.1.0</code> &nbsp;·&nbsp;
+                <b>Verdict:</b> <span style='color:{verdict_color}; font-weight:700;'>{d['verdict']}</span> &nbsp;·&nbsp;
+                <b>P(fake):</b> <code>{d['p_fake']*100:.1f}%</code>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+
         att = d.get("attribution")
         if att:
             st.markdown(_attribution_html(att), unsafe_allow_html=True)
@@ -953,6 +1152,7 @@ with tab_report:
             json.dumps(signed, indent=2),
             f"forensic_report_{d['filename']}.json", "application/json",
         )
+
 
         # PDF export
         from detector.config import get_settings

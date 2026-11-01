@@ -6,7 +6,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 from PIL import Image
 
-from detector.audio_io import load_audio
+from detector.audio_io import compute_vad_mask, is_silent_or_ambient, load_audio
 from detector.pipeline import get_pipeline
 
 matplotlib.use("Agg")
@@ -23,10 +23,13 @@ def detect_audio(audio_file, chunk_seconds=3):
         {"start": s["start"], "end": s["end"],
          "label": "Fake" if s["fake_probability"] >= 0.5 else "Real",
          "confidence": f"{max(s['fake_probability'], 1 - s['fake_probability']):.2f}",
-         "fake_prob": s["fake_probability"]}
+         "fake_prob": s["fake_probability"],
+         "is_speech": s.get("is_speech", True),
+         "speech_ratio": s.get("speech_ratio", 1.0)}
         for s in res.segments if "fake_probability" in s
     ]
     return res.verdict, f"{conf:.2f}", segs, res.artifacts.get("mel"), res.timeline
+
 
 
 def get_waveform_image(audio_path):

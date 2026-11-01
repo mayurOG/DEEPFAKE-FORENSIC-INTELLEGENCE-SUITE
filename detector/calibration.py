@@ -285,15 +285,18 @@ class OODModel:
 
     def distance(self, emb: np.ndarray) -> np.ndarray:
         x = np.atleast_2d(np.asarray(emb, dtype=np.float64))
-        if not self.fitted:
+        if not self.fitted or self.mean is None or x.shape[1] != len(self.mean):
             return np.zeros(len(x))
         xc = x - self.mean
         d2 = np.einsum("ij,jk,ik->i", xc, self.precision, xc)
         return np.sqrt(np.maximum(d2, 0.0))
 
     def is_ood(self, emb: np.ndarray) -> Tuple[Optional[bool], Optional[float]]:
-        """Returns (is_ood, score_ratio). ``(None, None)`` when unfitted."""
-        if not self.fitted or emb is None:
+        """Returns (is_ood, score_ratio). ``(None, None)`` when unfitted or dimension mismatch."""
+        if not self.fitted or emb is None or self.mean is None:
+            return None, None
+        x = np.atleast_2d(np.asarray(emb, dtype=np.float64))
+        if x.shape[1] != len(self.mean):
             return None, None
         d = float(self.distance(emb)[0])
         ratio = d / self.threshold if self.threshold > 0 else 0.0

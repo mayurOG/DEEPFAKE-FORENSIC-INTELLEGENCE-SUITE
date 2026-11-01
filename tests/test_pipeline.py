@@ -189,3 +189,35 @@ def test_narrative_mentions_new_explanations(pipe):
     assert ex["method"] == "multiscale-occlusion" and "counterfactual" in ex
     assert "Consistency under mirror/crop" in res.narrative
     assert "Counterfactual" in res.narrative
+
+
+def test_explain_curves_iou_and_temporal_smoothing():
+    from detector.explain import (
+        compute_saliency_iou, deletion_insertion_curves,
+        project_face_heatmap_to_canvas, temporal_heatmap_smoothing,
+    )
+    img = make_img(60, 0, -60)
+    score_fn = lambda imgs: np.array([stub_image_fn(i)[0] for i in imgs])
+    imp = np.zeros((6, 6))
+    imp[:3, :3] = 5.0
+    curves = deletion_insertion_curves(score_fn, img, imp, steps=4)
+    assert "deletion_curve" in curves and "insertion_curve" in curves
+    assert len(curves["deletion_curve"]) == 5
+
+    # IoU against synthetic ground truth mask
+    gt_mask = np.zeros((6, 6))
+    gt_mask[:3, :3] = 1.0
+    iou = compute_saliency_iou(imp, gt_mask)
+    assert 0.8 <= iou <= 1.0
+
+    # Temporal heatmap smoothing across 3 frames
+    m1 = np.ones((6, 6)) * 1.0
+    m2 = np.ones((6, 6)) * 5.0
+    smoothed = temporal_heatmap_smoothing([m1, m2], alpha=0.5)
+    assert len(smoothed) == 2
+    assert abs(smoothed[1].mean() - 3.0) < 1e-6
+
+    # Face canvas projection
+    canvas = project_face_heatmap_to_canvas(np.ones((4, 4)), [10, 10, 30, 30], (100, 100))
+    assert canvas.shape == (100, 100)
+    assert canvas[15, 15] == 1.0 and canvas[0, 0] == 0.0

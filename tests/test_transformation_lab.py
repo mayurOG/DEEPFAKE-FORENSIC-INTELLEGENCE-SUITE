@@ -60,3 +60,15 @@ def test_verdict_fn_and_audio_transforms():
     assert all(o.shape == w.shape and np.isfinite(o).all() for o in outs)
     pa = robustness_profile(lambda ws: [float(np.std(x)) * 10 - 1 for x in ws], w, tr)
     assert len(pa["rows"]) == len(tr)
+
+
+def test_evaluate_degradation_impact():
+    from detector.transformation_lab import DEGRADATION_SUITES, evaluate_degradation_impact
+    imgs = [make_img(-40, 0, 40, seed=i) for i in range(5)] + [make_img(40, 0, -40, seed=100 + i) for i in range(5)]
+    labels = [0] * 5 + [1] * 5
+    score_fn = lambda batch: [stub_image_fn(im)[0] for im in batch]
+    res = evaluate_degradation_impact(score_fn, imgs, labels, suite=DEGRADATION_SUITES["jpeg"])
+    assert "base_auc" in res and res["base_auc"] is not None
+    assert "levels" in res and len(res["levels"]) == 4
+    for lvl in res["levels"]:
+        assert "delta_auc" in lvl and "flip_rate" in lvl and "fpr_increase" in lvl

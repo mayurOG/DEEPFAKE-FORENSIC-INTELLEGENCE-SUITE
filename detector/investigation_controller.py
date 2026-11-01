@@ -48,6 +48,27 @@ _GH_W = _GH_W / _GH_W.sum()
 
 
 @dataclass
+class CostProfile:
+    """Hardware-aware cost model: lambda_t * T_e + lambda_m * M_e + lambda_c * C_e."""
+    lambda_t: float = 1.0    # weight on inference latency (seconds)
+    lambda_m: float = 0.001  # weight on memory footprint (MB)
+    lambda_c: float = 0.1    # weight on computational intensity / GPU weight
+
+    def effective_cost(
+        self,
+        cost: float,
+        time_s: Optional[float] = None,
+        memory_mb: Optional[float] = None,
+        compute: Optional[float] = None,
+    ) -> float:
+        t = time_s if time_s is not None else cost
+        m = memory_mb if memory_mb is not None else 0.0
+        c = compute if compute is not None else 1.0
+        hw_cost = self.lambda_t * t + self.lambda_m * m + self.lambda_c * c
+        return max(hw_cost, 1e-4)
+
+
+@dataclass
 class TestSpec:
     """A runnable analysis the controller may choose."""
 
@@ -58,6 +79,19 @@ class TestSpec:
     available: Callable[[Dict[str, Any]], bool] = lambda ctx: True
     unavailable_reason: str = "not applicable"
     heuristic: bool = False
+    # Hardware-aware cost attributes
+    time_s: Optional[float] = None
+    memory_mb: Optional[float] = None
+    compute_intensity: Optional[float] = None
+    modality: str = "image"        # image | video | audio
+    instability: float = 0.0       # transformation sensitivity in [0, 1]
+
+    def get_cost(self, profile: Optional[CostProfile] = None) -> float:
+        if profile is None:
+            return self.cost
+        return profile.effective_cost(
+            self.cost, self.time_s, self.memory_mb, self.compute_intensity
+        )
 
 
 def _gls_var(names: Sequence[str], prec: Sequence[float],
@@ -75,6 +109,7 @@ def expected_benefit(
     weights: Optional[Dict[str, float]] = None,
     corr: Optional[Dict[str, Dict[str, float]]] = None,
     lam: float = 0.3,
+    instability_penalty: float = 0.0,
 ) -> Dict[str, float]:
     """E[dR] and E[dH] for adding one more test with the given precision."""
     cur = gls_fuse(evidences, weights, corr)
@@ -86,6 +121,10 @@ def expected_benefit(
         w.update(weights)
     names = [e.name for e in used]
     prec = [max(w.get(e.name, 0.3), 0.0) * e.reliability for e in used]
+    # Penalize experts whose predictions are unstable under transformations
+    penalty_factor = max(1.0 - 0.5 * float(np.clip(instability_penalty, 0.0, 0.9)), 0.1)
+    cand_precision = cand_precision * penalty_factor
+
     v_old = _gls_var(names, prec, corr)
     v_new = _gls_var(names + [cand_name], prec + [cand_precision], corr)
     v_new = min(v_new, v_old)
@@ -112,6 +151,8 @@ class Step:
     risk_before: Optional[float] = None
     risk_after: Optional[float] = None
     logit: Optional[float] = None
+    realized_d_risk: Optional[float] = None
+    actually_improved: Optional[bool] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {k: (round(v, 4) if isinstance(v, float) else v)
@@ -132,6 +173,9 @@ class InvestigationController:
         policy: str = "voi", weights: Optional[Dict[str, float]] = None,
         corr: Optional[Dict[str, Dict[str, float]]] = None, seed: int = 0,
         fixed_order: Optional[Sequence[str]] = None,
+        cost_profile: Optional[CostProfile] = None,
+        min_evidence_count: int = 1,
+        learned_reliability: Optional[Dict[str, Dict[str, float]]] = None,
     ):
         if policy not in ("voi", "fixed", "random", "quality"):
             raise ValueError("policy must be voi | fixed | random | quality")
@@ -141,6 +185,21 @@ class InvestigationController:
         self.policy, self.weights, self.corr = policy, weights, corr
         self.fixed_order = list(fixed_order) if fixed_order else [t.name for t in registry]
         self._rng = random.Random(seed)
+        self.cost_profile = cost_profile or CostProfile()
+        self.min_evidence_count = min_evidence_count
+        self.learned_reliability = learned_reliability or self._load_learned_reliability()
+
+    def _load_learned_reliability(self) -> Dict[str, Dict[str, float]]:
+        """Load empirical validation reliability if saved in artifacts."""
+        try:
+            from detector.config import get_settings
+            p = os.path.join(get_settings().artifact_dir, "expert_reliability.json")
+            if os.path.exists(p):
+                with open(p, "r", encoding="utf-8") as f:
+                    return json.load(f)
+        except Exception:
+            pass
+        return {}
 
     # -- scoring -------------------------------------------------------------
     def rank(self, evidences: Sequence[Evidence], ctx: Dict[str, Any],
@@ -148,6 +207,7 @@ class InvestigationController:
         w = dict(DEFAULT_WEIGHTS)
         if self.weights:
             w.update(self.weights)
+        instability_map = ctx.get("instability", {})
         rows = []
         for name, t in self.registry.items():
             if name in done:
@@ -155,14 +215,26 @@ class InvestigationController:
             if not t.available(ctx):
                 rows.append({"test": name, "eligible": False, "why": t.unavailable_reason})
                 continue
-            if t.cost > remaining + 1e-12:
+            effective_cost = t.get_cost(self.cost_profile)
+            if effective_cost > remaining + 1e-12:
                 rows.append({"test": name, "eligible": False, "why": "over budget"})
                 continue
-            prec = w.get(name, 0.3) * float(np.clip(t.reliability(ctx), 0.0, 1.0))
-            b = expected_benefit(evidences, name, prec, self.weights, self.corr, self.lam)
-            u = (b["d_risk"] + self.lam * b["d_entropy"]) / (t.cost + self.eps)
-            rows.append({"test": name, "eligible": True, "utility": u, "cost": t.cost,
-                         "precision": prec, **b})
+
+            inst = float(instability_map.get(name, t.instability))
+            base_rel = float(np.clip(t.reliability(ctx), 0.0, 1.0))
+            if self.learned_reliability and name in self.learned_reliability.get(t.modality, {}):
+                prec = float(self.learned_reliability[t.modality][name])
+            else:
+                prec = w.get(name, 0.3) * base_rel
+
+            b = expected_benefit(
+                evidences, name, prec, self.weights, self.corr, self.lam,
+                instability_penalty=inst,
+            )
+            # Hardware-aware Value of Information
+            u = (b["d_risk"] + self.lam * b["d_entropy"]) / (effective_cost + self.eps)
+            rows.append({"test": name, "eligible": True, "utility": u, "cost": effective_cost,
+                         "precision": prec, "instability": inst, **b})
         elig = sorted([r for r in rows if r["eligible"]], key=lambda r: (-r["utility"], r["test"]))
         return elig + [r for r in rows if not r["eligible"]]
 
@@ -172,7 +244,8 @@ class InvestigationController:
 
     def choose(self, evidences: Sequence[Evidence], ctx: Dict[str, Any],
                remaining: float, done: Sequence[str]) -> Tuple[Optional[str], str, Optional[Dict]]:
-        if self._risk_now(evidences) <= self.risk_target:
+        used_count = len(_used(evidences))
+        if used_count >= self.min_evidence_count and self._risk_now(evidences) <= self.risk_target:
             return None, "risk_target_met", None
         ranked = self.rank(evidences, ctx, remaining, done)
         elig = [r for r in ranked if r["eligible"]]
@@ -207,18 +280,27 @@ class InvestigationController:
                 stop = why
                 break
             t = self.registry[name]
+            cost_step = t.get_cost(self.cost_profile)
+            risk_before = self._risk_now(ev)
             result = executor(name)
             done.append(name)
-            spent += t.cost
+            spent += cost_step
             ev.append(result)
+            risk_after = self._risk_now(ev)
+            realized_d = max(risk_before - risk_after, 0.0)
+            improved = bool(risk_after < risk_before - 1e-6)
+
             steps.append(Step(
-                test=name, reason=why, cost=t.cost,
+                test=name, reason=why, cost=cost_step,
                 utility=None if info is None else info.get("utility"),
                 d_risk=None if info is None else info.get("d_risk"),
                 d_entropy=None if info is None else info.get("d_entropy"),
-                risk_before=None if info is None else info.get("risk_before"),
-                risk_after=self._risk_now(ev),
-                logit=None if result.logit is None else float(result.logit)))
+                risk_before=risk_before,
+                risk_after=risk_after,
+                logit=None if result.logit is None else float(result.logit),
+                realized_d_risk=realized_d,
+                actually_improved=improved,
+            ))
             if len(done) >= len(self.registry):
                 stop = "all_tests_run"
                 break
@@ -231,7 +313,11 @@ class InvestigationController:
                                 "no_eligible_test": "budget exhausted",
                                 }.get(stop, stop))
                 not_run.append({"test": name, "reason": reason})
+        improved_count = sum(1 for s in steps if s.actually_improved)
         return {"evidence": ev, "steps": [s.to_dict() for s in steps],
                 "not_run": not_run, "stop_reason": stop, "spent": spent,
                 "final_risk": self._risk_now(ev), "risk_target": self.risk_target,
-                "policy": self.policy, "budget": self.budget}
+                "policy": self.policy, "budget": self.budget,
+                "improved_count": improved_count,
+                "efficiency_ratio": (improved_count / len(steps)) if steps else 1.0,
+                "min_evidence_count": self.min_evidence_count}

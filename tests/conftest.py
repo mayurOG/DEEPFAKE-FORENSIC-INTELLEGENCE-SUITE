@@ -41,6 +41,7 @@ def art_dir(tmp_path):
 @pytest.fixture
 def settings(art_dir, monkeypatch):
     monkeypatch.setenv("DEEPFAKE_ARTIFACT_DIR", art_dir)
+    monkeypatch.delenv("DEEPFAKE_REPORT_PUBKEY", raising=False)
     return dataclasses.replace(get_settings(), artifact_dir=art_dir)
 
 

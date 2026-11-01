@@ -128,3 +128,29 @@ def test_triage_jpeg_and_c2pa(tmp_path):
     assert detect_c2pa(b"nothing here")["c2pa_manifest_detected"] is False
     t = triage_image(b1.getvalue())
     assert "quality" in t or "sha256" in t
+
+
+def test_advanced_calibration_metrics():
+    y = [0] * 50 + [1] * 50
+    p = [0.1] * 40 + [0.3] * 10 + [0.7] * 10 + [0.9] * 40
+    aece = metrics.adaptive_ece(y, p, bins=5)
+    assert 0.0 <= aece <= 1.0
+    cw = metrics.class_wise_ece(y, p, bins=5)
+    assert "ece_real" in cw and "ece_fake" in cw and "class_wise_mean" in cw
+    rd = metrics.reliability_diagram_data(y, p, bins=5)
+    assert "bin_centers" in rd and "confidence" in rd and "accuracy" in rd
+    assert rd["nll"] > 0
+    assert rd["brier"] >= 0
+
+
+def test_conformal_evaluation_metrics():
+    y = [0, 0, 1, 1]
+    sets = [["Real"], ["Real", "Fake"], ["Fake"], ["Real"]]
+    tags = ["clean", "clean", "compressed", "compressed"]
+    m = metrics.conformal_evaluation_metrics(y, sets, condition_tags=tags)
+    assert m["empirical_coverage"] == 0.75  # 3 of 4 covered
+    assert m["coverage_real"] == 1.0        # both 0s covered
+    assert m["coverage_fake"] == 0.5        # 1 of 2 fake covered
+    assert m["fraction_singleton"] == 0.75  # 3 of 4 have size 1
+    assert "conditional_by_tag" in m
+    assert m["conditional_by_tag"]["clean"]["coverage"] == 1.0

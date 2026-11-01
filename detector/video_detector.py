@@ -28,6 +28,17 @@ def detect_video(video_file, frame_skip=15):
         "fake_percentage": f"{(fake_count / total * 100) if total else 0.0:.1f}%",
         "video_fps": f"{res.quality.get('fps') or 0:.1f}",
     }
+    temporal_ev = next((e for e in res.evidence if e.get("name") == "temporal"), None)
+    if temporal_ev and temporal_ev.get("detail"):
+        d = temporal_ev["detail"]
+        if "n_eff" in d:
+            summary["effective_sample_size"] = d["n_eff"]
+        if "autocorr_lag1" in d:
+            summary["frame_autocorrelation"] = d["autocorr_lag1"]
+        if "anomaly_detected" in d:
+            summary["temporal_anomaly_detected"] = d["anomaly_detected"]
+
     fake_frames = [im for _, im in res.artifacts.get("suspicious_frames", [])]
     return (res.verdict, total, fake_count, summary, fake_frames, [],
             timeline, None)
+

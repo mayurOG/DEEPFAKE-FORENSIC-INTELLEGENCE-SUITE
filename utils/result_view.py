@@ -169,6 +169,168 @@ def _attribution_section(att: dict):
             st.plotly_chart(fig, use_container_width=True)
 
 
+def _render_provenance_badge(prov: dict):
+    if not prov:
+        return
+    state = prov.get("validation_state") or ("valid" if prov.get("c2pa_valid") else "absent")
+    claimed = prov.get("declared_ai_source")
+    signer = (prov.get("certificate_info") or {}).get("issuer") or prov.get("note", "")
+
+    if state == "valid":
+        color = "#22c55e"
+        bg = "rgba(34,197,94,0.12)"
+        border = "rgba(34,197,94,0.35)"
+        icon = "🛡️"
+        title = "C2PA Cryptographically Verified Manifest"
+        status_text = "Content credentials verified with trusted digital certificate."
+    elif state == "invalid":
+        color = "#ef4444"
+        bg = "rgba(239,68,68,0.12)"
+        border = "rgba(239,68,68,0.35)"
+        icon = "🚨"
+        title = "C2PA Manifest Corrupted or Tampered"
+        status_text = "Cryptographic signature check failed. Possible asset modification or stripping."
+    elif state == "unverifiable":
+        color = "#f59e0b"
+        bg = "rgba(245,158,11,0.12)"
+        border = "rgba(245,158,11,0.35)"
+        icon = "⚠️"
+        title = "C2PA Manifest Present (Unverified Root)"
+        status_text = "Manifest present but certificate chain unverified or self-signed."
+    else:
+        return
+
+    signer_html = f"&nbsp;·&nbsp; <b>Signer/Issuer:</b> {signer}" if signer else ""
+    claimed_html = f"<div style='color:#fca5a5; font-size:0.82rem; margin-top:3px;'><b>Declared AI Generator:</b> {claimed}</div>" if claimed else ""
+    st.markdown(f"""
+    <div style='background:{bg}; border:1px solid {border}; border-radius:12px; padding:12px 18px; margin-bottom:16px; display:flex; align-items:center; gap:14px;'>
+        <div style='font-size:1.8rem;'>{icon}</div>
+        <div>
+            <div style='color:{color}; font-weight:700; font-size:1.0rem;'>{title}</div>
+            <div style='color:#cbd5e1; font-size:0.85rem;'>{status_text}{signer_html}</div>
+            {claimed_html}
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+
+def _render_fusion_baselines(res_dict: dict, key: str):
+    with st.expander("⚖️ Multi-Expert Fusion Analysis & Baseline Benchmarks", expanded=False):
+        fusion = res_dict.get("fusion") or {}
+        ev_list = res_dict.get("evidence", [])
+        used_ev = [e for e in ev_list if e.get("status") == "used" and e.get("logit") is not None]
+        if not used_ev:
+            st.caption("No used evidence available for fusion benchmarking.")
+            return
+
+        z_vals = [e["logit"] for e in used_ev]
+        p_vals = [1.0 / (1.0 + np.exp(-z)) for z in z_vals]
+        best_ev = max(used_ev, key=lambda e: e.get("reliability", 0.5))
+        best_p = 1.0 / (1.0 + np.exp(-best_ev["logit"]))
+        simple_p = float(np.mean(p_vals))
+        fixed_p = float(res_dict.get("p_fake", simple_p))
+        gls_p = float(1.0 / (1.0 + np.exp(-fusion.get("logit", res_dict.get("tier1_logit", 0.0)))))
+
+        f_col1, f_col2, f_col3, f_col4 = st.columns(4)
+        f_col1.metric("1. Best Single Expert", f"{best_p*100:.1f}%", help=f"Expert: {best_ev['name']}")
+        f_col2.metric("2. Simple Average", f"{simple_p*100:.1f}%", help="Unweighted mean of probabilities")
+        f_col3.metric("3. Fixed Weighted", f"{fixed_p*100:.1f}%", help="Standard heuristic weighting")
+        f_col4.metric("4. Regularized GLS (Ours)", f"{gls_p*100:.1f}%", help="Covariance-shrinkage generalized least squares")
+
+        df_baselines = pd.DataFrame({
+            "Fusion Method": ["1. Best Expert", "2. Simple Average", "3. Fixed Weighted", "4. Learned GLS (Ours)"],
+            "P(fake) %": [best_p * 100, simple_p * 100, fixed_p * 100, gls_p * 100],
+        })
+        fig = px.bar(
+            df_baselines, x="P(fake) %", y="Fusion Method", orientation="h",
+            color="Fusion Method",
+            color_discrete_map={
+                "1. Best Expert": "#64748b",
+                "2. Simple Average": "#94a3b8",
+                "3. Fixed Weighted": "#818cf8",
+                "4. Learned GLS (Ours)": "#38bdf8",
+            }
+        )
+        fig.add_vline(x=50.0, line_dash="dash", line_color="#ef4444", annotation_text="Threshold")
+        fig.update_layout(
+            showlegend=False,
+            paper_bgcolor="rgba(0,0,0,0)",
+            plot_bgcolor="rgba(8,14,32,0.6)",
+            font_color="#94a3b8",
+            height=200,
+            margin=dict(t=10, b=25, l=120, r=20),
+            xaxis=dict(range=[0, 100], gridcolor="rgba(51,65,85,0.4)"),
+            yaxis=dict(gridcolor="rgba(51,65,85,0.4)"),
+        )
+        st.plotly_chart(fig, use_container_width=True, key=f"fusion_base_{key}")
+
+
+def _render_audio_forensics(res_dict: dict, artifacts: dict, key: str):
+    st.markdown("### 🎙️ Audio Forensics & Voice Activity Analysis")
+    audio_ev = next((e for e in res_dict.get("evidence", []) if e.get("name") == "audio"), None)
+    det = (audio_ev.get("detail") or {}) if audio_ev else {}
+    speech_ratio = det.get("speech_ratio")
+    snr_db = det.get("mean_snr_db")
+    speech_detected = det.get("speech_detected", True)
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Voiced Speech Ratio", f"{speech_ratio * 100:.1f}%" if speech_ratio is not None else "100.0%",
+              help="Fraction of audio containing active voiced speech detected via VAD")
+    m2.metric("Estimated SNR", f"{snr_db:+.1f} dB" if snr_db is not None else "n/a",
+              help="Signal-to-noise ratio in decibels")
+    m3.metric("Speech Segments", det.get("active_speech_chunks", det.get("chunks", "—")),
+              help="Active speech chunk count")
+    m4.metric("Silence Gating", "✓ Active" if speech_detected else "⚠️ Gated (Silence)",
+              help="Silence / ambient noise gating to prevent false positives")
+
+    if not speech_detected or (speech_ratio is not None and speech_ratio < 0.05):
+        st.info("ℹ️ **Voice Activity Gating Active:** The audio track appears to be silence or ambient room tone. Deepfake voice scoring was gated to avoid unvoiced false-positive predictions.")
+
+    tl = res_dict.get("timeline") or []
+    if tl:
+        fig = go.Figure()
+        ts = [t["timestamp"] for t in tl]
+        ps = [t["fake_probability"] for t in tl]
+        fig.add_trace(go.Bar(
+            x=ts, y=ps,
+            marker_color=["#ef4444" if p >= 0.5 else "#22c55e" for p in ps],
+            name="Chunk P(fake)",
+        ))
+        fig.add_hline(y=0.5, line_dash="dash", line_color="#64748b", annotation_text="Decision Boundary")
+        fig.update_layout(
+            title="Per-Chunk Manipulation Probability",
+            xaxis_title="Time (seconds)", yaxis_title="P(manipulated)",
+            yaxis=dict(range=[0, 1]),
+            paper_bgcolor="rgba(0,0,0,0)",
+            plot_bgcolor="rgba(8,14,32,0.6)",
+            font_color="#94a3b8",
+            height=240,
+            margin=dict(t=35, b=30, l=40, r=20),
+        )
+        st.plotly_chart(fig, use_container_width=True, key=f"audio_tl_{key}")
+
+    if artifacts.get("mel") is not None:
+        st.image(artifacts["mel"], caption="Log-Mel Frequency Spectrogram (16 kHz)", use_column_width=True)
+
+
+def _render_video_temporal_details(res_dict: dict, key: str):
+    temp_ev = next((e for e in res_dict.get("evidence", []) if e.get("name") == "temporal"), None)
+    det = (temp_ev.get("detail") or {}) if temp_ev else {}
+    n_eff = det.get("n_eff")
+    n_frames = det.get("n_frames")
+    rho = det.get("autocorr_lag1")
+    anomaly = det.get("anomaly_detected", False)
+
+    v1, v2, v3, v4 = st.columns(4)
+    v1.metric("Sampled Frames", n_frames if n_frames is not None else "—")
+    v2.metric("Effective Sample Size (N_eff)", f"{n_eff:.1f}" if n_eff is not None else "—",
+              help="Autocorrelation-adjusted independent sample information")
+    v3.metric("Temporal Autocorrelation (ρ₁)", f"{rho:+.2f}" if rho is not None else "—",
+              help="Frame-to-frame correlation. High = redundant consecutive frames")
+    v4.metric("Temporal Anomaly Burst", "🚨 Detected" if anomaly else "✓ Clean",
+              help="Targeted manipulation confined to specific frame interval")
+
+
 def render_result(res_dict: dict, artifacts: dict, key: str = "r"):
     """Full result view used by the single-file scanner — v4.0."""
     render_result_card(res_dict)
@@ -178,6 +340,9 @@ def render_result(res_dict: dict, artifacts: dict, key: str = "r"):
     st_ = res_dict.get("stability") or {}
     un = res_dict.get("uncertainty") or {}
     cf = expl.get("counterfactual") or {}
+
+    # ── Cryptographic Provenance Badge ─────────────────────────────────────
+    _render_provenance_badge(res_dict.get("provenance"))
 
     # ── Top metrics row ───────────────────────────────────────────────────
     c1, c2, c3, c4 = st.columns(4)
@@ -241,6 +406,13 @@ def render_result(res_dict: dict, artifacts: dict, key: str = "r"):
         else:
             st.caption("Contribution chart\nunavailable.")
 
+    # ── Multi-Expert Fusion Baselines ─────────────────────────────────────
+    _render_fusion_baselines(res_dict, key)
+
+    # ── AUDIO: Forensics & VAD ────────────────────────────────────────────
+    if media == "audio":
+        _render_audio_forensics(res_dict, artifacts, key)
+
     # ── IMAGE: Advanced Forensic Visual Analysis ──────────────────────────
     if media == "image":
         st.markdown("### 🖼️ Advanced Forensic Visual Analysis")
@@ -248,6 +420,7 @@ def render_result(res_dict: dict, artifacts: dict, key: str = "r"):
         # Top row: Annotated + Occlusion Heatmap + Tamper map.
         vis_cols = st.columns(3)
         if artifacts.get("annotated") is not None:
+
             vis_cols[0].image(artifacts["annotated"], caption="👤 Face detection overlay",
                               use_column_width=True)
         if artifacts.get("heatmap") is not None:
@@ -257,7 +430,17 @@ def render_result(res_dict: dict, artifacts: dict, key: str = "r"):
             vis_cols[2].image(artifacts["tamper_map"], use_column_width=True,
                               caption="🪬 SRM noise-inconsistency localization")
 
+        st.markdown(
+            "<div style='font-size:0.8rem; color:#94a3b8; background:rgba(30,41,59,0.3); "
+            "border-left:3px solid #38bdf8; padding:8px 12px; margin:8px 0 16px 0; border-radius:4px;'>"
+            "<b>Forensic Notice:</b> Occlusion heatmaps identify spatial regions influencing the detector's "
+            "prediction; they do not necessarily indicate the exact pixels altered by an attacker."
+            "</div>",
+            unsafe_allow_html=True,
+        )
+
         src_img = artifacts.get("source_image")
+
 
         # 6-Panel forensic grid.
         st.markdown("#### 🔬 6-Panel Forensic Grid")
@@ -341,10 +524,12 @@ def render_result(res_dict: dict, artifacts: dict, key: str = "r"):
 
     # ── VIDEO: Timeline + Suspicious Frame Contact Sheet ──────────────────
     if media == "video":
+        _render_video_temporal_details(res_dict, key)
         tl_fig = _timeline_chart(res_dict)
         if tl_fig:
             st.markdown("### 📈 Manipulation Probability Timeline")
             st.plotly_chart(tl_fig, use_container_width=True, key=f"tl_{key}")
+
             segs = res_dict.get("segments") or []
             if segs:
                 st.markdown(

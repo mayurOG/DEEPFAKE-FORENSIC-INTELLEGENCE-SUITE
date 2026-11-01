@@ -79,3 +79,23 @@ def test_decision_risk():
     assert decision_risk(0.0, 1.0) == 0.5
     assert decision_risk(5.0, 1.0) < 1e-5
     assert decision_risk(1.0, math.inf) == 0.5
+
+
+def test_compare_fusion_baselines():
+    from detector.evidence_graph import compare_fusion_baselines
+    ev = [E("neural", 2.5, 0.9), E("audio", 1.8, 0.8), E("tamper", 0.5, 0.4)]
+    comp = compare_fusion_baselines(ev)
+    assert "individual_best" in comp and comp["individual_best"]["name"] == "neural"
+    assert "simple_averaging" in comp and 0.0 <= comp["simple_averaging"]["p_fake"] <= 1.0
+    assert "fixed_weighted" in comp and 0.0 <= comp["fixed_weighted"]["p_fake"] <= 1.0
+    assert "learned_gls" in comp and 0.0 <= comp["learned_gls"]["p_fake"] <= 1.0
+
+
+def test_ill_conditioned_covariance_fallback():
+    # Near identical correlated experts with rho=0.9999999
+    c = {"neural": {"temporal": 0.9999999}, "temporal": {"neural": 0.9999999}}
+    ev = [E("neural", 2.0), E("temporal", 2.0)]
+    out = gls_fuse(ev, corr=c, regularization=0.0)
+    # Shouldn't crash, should return valid finite logit
+    assert np.isfinite(out["logit"])
+    assert out["n_used"] == 2

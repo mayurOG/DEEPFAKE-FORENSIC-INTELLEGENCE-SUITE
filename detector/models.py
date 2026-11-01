@@ -826,9 +826,7 @@ def get_image_backends() -> List[ImageBackend]:
             if os.path.exists(probe):
                 embed_id = _probe_encoder_model_id(probe, s.embed_model_id)
                 if embed_id:
-                    b = _try_backend(lambda: ProbeBackend(embed_id, probe), f"probe({embed_id})")
-                    if b:
-                        backends.append(b)
+                    backends.append(ProbeBackend(embed_id, probe))
 
             # 2. Primary HF classifier — configured model first, then fallbacks.
             configured_primary = s.image_model_id or ""

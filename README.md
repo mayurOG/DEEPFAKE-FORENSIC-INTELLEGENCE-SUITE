@@ -137,8 +137,8 @@ Unit tests (synthetic data) validate software behaviour only — **not** detecti
 ## Install
 
 ```bash
-git clone https://github.com/mayurOG/DEEPFAKE-ANALYSYS-SYSTEM.git
-cd DEEPFAKE-ANALYSYS-SYSTEM
+git clone https://github.com/mayurOG/DEEPFAKE-FORENSIC-INTELLIGENCE-SUITE.git
+cd DEEPFAKE-FORENSIC-INTELLIGENCE-SUITE
 python -m venv venv && source venv/bin/activate   # Windows: venv\Scripts\activate
 pip install -r requirements.txt
 # optional, better face detection (pins an old torch, so install without deps):

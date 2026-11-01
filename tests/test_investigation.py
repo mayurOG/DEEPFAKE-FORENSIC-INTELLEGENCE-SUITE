@@ -78,3 +78,61 @@ def test_baseline_policies_and_determinism():
         assert False
     except ValueError:
         pass
+
+
+def test_hardware_aware_cost_profile():
+    from detector.investigation_controller import CostProfile
+    # Profile that heavily penalizes latency
+    cp_time = CostProfile(lambda_t=10.0, lambda_m=0.0, lambda_c=0.0)
+    spec_fast = TestSpec("fast", cost=0.1, time_s=0.01, memory_mb=100.0)
+    spec_slow = TestSpec("slow", cost=0.1, time_s=0.5, memory_mb=10.0)
+    assert spec_fast.get_cost(cp_time) < spec_slow.get_cost(cp_time)
+
+    # Profile that heavily penalizes memory
+    cp_mem = CostProfile(lambda_t=0.0, lambda_m=1.0, lambda_c=0.0)
+    assert spec_fast.get_cost(cp_mem) > spec_slow.get_cost(cp_mem)
+
+
+def test_instability_penalty_reduces_utility():
+    specs = [
+        TestSpec("stable", 0.2, lambda c: 0.9, instability=0.0),
+        TestSpec("unstable", 0.2, lambda c: 0.9, instability=0.8),
+    ]
+    c = InvestigationController(specs, risk_target=0.001, budget=2.0)
+    ranked = c.rank([E("neural", 0.5)], {}, 2.0)
+    assert ranked[0]["test"] == "stable"
+    assert ranked[1]["test"] == "unstable"
+    assert ranked[0]["utility"] > ranked[1]["utility"]
+
+
+def test_learned_reliability_overrides_prior():
+    specs = [
+        TestSpec("neural_probe", 0.2, lambda c: 0.5, modality="image"),
+        TestSpec("tamper", 0.2, lambda c: 0.9, modality="image"),
+    ]
+    # Learned validation precision says neural_probe is actually much more reliable
+    learned = {"image": {"neural_probe": 1.5, "tamper": 0.2}}
+    c = InvestigationController(specs, learned_reliability=learned, risk_target=0.001, budget=2.0)
+    ranked = c.rank([E("neural", 0.5)], {}, 2.0)
+    assert ranked[0]["test"] == "neural_probe"
+    assert ranked[0]["precision"] == 1.5
+
+
+def test_min_evidence_requirement_prevents_premature_exit():
+    specs = [TestSpec("audio", 0.1, lambda c: 0.9)]
+    # Risk target would be met by current neural evidence alone, but min_evidence_count=2
+    c = InvestigationController(specs, risk_target=0.05, min_evidence_count=2)
+    name, reason, _ = c.choose([E("neural", 6.0)], {}, remaining=1.0, done=[])
+    assert name == "audio"  # must still run audio to fulfill min_evidence_count
+
+
+def test_tracking_realized_improvement():
+    specs = [TestSpec("audio", 0.1, lambda c: 0.9)]
+    c = InvestigationController(specs, risk_target=0.001, budget=1.0)
+    out = c.run([E("neural", 0.5)], {}, lambda n: E(n, 4.0))
+    assert out["steps"]
+    step = out["steps"][0]
+    assert step["actually_improved"] is True
+    assert step["realized_d_risk"] > 0
+    assert out["improved_count"] == 1
+    assert out["efficiency_ratio"] == 1.0

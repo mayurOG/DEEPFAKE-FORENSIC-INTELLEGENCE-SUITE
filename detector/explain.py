@@ -322,3 +322,117 @@ def build_narrative(r: Dict) -> str:
     for note in r.get("quality", {}).get("notes", []):
         lines.append(f"Note: {note}")
     return "\n".join(lines)
+
+
+EXPLANATION_DISCLAIMER = (
+    "Forensic Notice: Occlusion heatmaps identify spatial regions influencing "
+    "the detector's prediction; they do not necessarily indicate the exact pixels altered by an attacker."
+)
+
+
+def deletion_insertion_curves(
+    score_fn: ScoreFn, img: Image.Image, importance: np.ndarray, steps: int = 8,
+) -> Dict[str, Any]:
+    """Calculate deletion and insertion curves to validate explanation faithfulness.
+
+    * Deletion: progressively mask highest-importance cells. Scores should drop quickly.
+    * Insertion: progressively reveal highest-importance cells from a blurred baseline. Scores should rise quickly.
+    AU-DEL (lower is more faithful deletion) and AU-INS (higher is more faithful insertion).
+    """
+    grid = importance.shape[0]
+    cells = grid * grid
+    rgb = img.convert("RGB")
+    arr = np.asarray(rgb).copy()
+    fill = arr.reshape(-1, 3).mean(axis=0).astype(arr.dtype)
+    order = np.argsort(-importance.reshape(-1))
+
+    # Deletion progression
+    del_variants = [rgb]
+    ins_baseline = np.full_like(arr, fill)
+    ins_variants = [Image.fromarray(ins_baseline)]
+
+    step_sizes = np.linspace(0, cells, steps + 1).astype(int)[1:]
+    for k in step_sizes:
+        # deletion
+        a_del = arr.copy()
+        for idx in order[:k]:
+            _mask_cell(a_del, idx // grid, idx % grid, grid, fill)
+        del_variants.append(Image.fromarray(a_del))
+
+        # insertion
+        a_ins = ins_baseline.copy()
+        for idx in order[:k]:
+            y0, y1 = (idx // grid) * arr.shape[0] // grid, ((idx // grid) + 1) * arr.shape[0] // grid
+            x0, x1 = (idx % grid) * arr.shape[1] // grid, ((idx % grid) + 1) * arr.shape[1] // grid
+            a_ins[y0:y1, x0:x1] = arr[y0:y1, x0:x1]
+        ins_variants.append(Image.fromarray(a_ins))
+
+    del_scores = np.asarray(score_fn(del_variants), dtype=np.float64)
+    ins_scores = np.asarray(score_fn(ins_variants), dtype=np.float64)
+
+    fractions = [0.0] + [float(k / cells) for k in step_sizes]
+    au_del = float(np.trapz(del_scores, fractions))
+    au_ins = float(np.trapz(ins_scores, fractions))
+
+    return {
+        "fractions": fractions,
+        "deletion_curve": [round(float(s), 4) for s in del_scores],
+        "insertion_curve": [round(float(s), 4) for s in ins_scores],
+        "au_del": round(au_del, 4),
+        "au_ins": round(au_ins),
+        "faithfulness_ratio": round(float(au_ins / (au_del + 1e-6)), 3),
+    }
+
+
+def compute_saliency_iou(
+    importance: np.ndarray, ground_truth_mask: np.ndarray, quantile_threshold: float = 0.80,
+) -> float:
+    """Calculate Intersection over Union (IoU) between predicted salient region and ground-truth manipulation mask."""
+    imp = np.asarray(importance, dtype=np.float64)
+    gt = np.asarray(ground_truth_mask) > 0
+
+    if imp.shape != gt.shape:
+        # Resize imp to gt dimensions
+        imp_img = Image.fromarray(imp).resize((gt.shape[1], gt.shape[0]), Image.BILINEAR)
+        imp = np.asarray(imp_img)
+
+    thresh = float(np.quantile(imp, quantile_threshold))
+    pred_mask = imp >= thresh
+    intersection = float(np.logical_and(pred_mask, gt).sum())
+    union = float(np.logical_or(pred_mask, gt).sum())
+    return float(intersection / union) if union > 0 else 1.0
+
+
+def temporal_heatmap_smoothing(
+    heatmaps: Sequence[np.ndarray], alpha: float = 0.65,
+) -> List[np.ndarray]:
+    """Smooth consecutive video frame saliency heatmaps using exponential moving average (EMA) to prevent flickering."""
+    if not heatmaps:
+        return []
+    smoothed = [np.asarray(heatmaps[0], dtype=np.float64).copy()]
+    for t in range(1, len(heatmaps)):
+        curr = np.asarray(heatmaps[t], dtype=np.float64)
+        prev = smoothed[-1]
+        if curr.shape == prev.shape:
+            smooth_frame = alpha * curr + (1.0 - alpha) * prev
+        else:
+            smooth_frame = curr
+        smoothed.append(smooth_frame)
+    return smoothed
+
+
+def project_face_heatmap_to_canvas(
+    face_importance: np.ndarray, face_box: Sequence[int], canvas_shape: Tuple[int, int],
+) -> np.ndarray:
+    """Map face-localized saliency map back to full-frame canvas coordinates."""
+    H, W = canvas_shape[:2]
+    canvas = np.zeros((H, W), dtype=np.float32)
+    x0, y0, x1, y1 = [int(v) for v in face_box[:4]]
+    bw, bh = max(1, x1 - x0), max(1, y1 - y0)
+
+    face_imp_img = Image.fromarray(face_importance.astype(np.float32)).resize(
+        (bw, bh), Image.BILINEAR
+    )
+    face_patch = np.asarray(face_imp_img)
+    canvas[y0:y0 + bh, x0:x0 + bw] = face_patch
+    return canvas

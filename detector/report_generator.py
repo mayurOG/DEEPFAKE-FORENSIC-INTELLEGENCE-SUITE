@@ -16,6 +16,7 @@ import hashlib
 import json
 import os
 from datetime import datetime, timezone
+from dataclasses import asdict
 from io import BytesIO
 from typing import Any, Dict, Optional, Tuple
 
@@ -220,7 +221,38 @@ def build_payload(result: Dict[str, Any]) -> Dict[str, Any]:
             "graph", "investigation", "robustness", "abstention_reason", "attribution", "grounded", "audit",
             "narrative", "warnings", "backends", "timings")
     payload = {k: result.get(k) for k in keep}
+    payload["schema_version"] = "4.1.0"
     payload["metadata"] = _slim_metadata(result.get("metadata"))
+
+    # Ensure original media SHA-256 is present
+    if not payload.get("sha256") and result.get("metadata"):
+        payload["sha256"] = result["metadata"].get("sha256")
+
+    # Configuration hash for reproducibility
+    try:
+        cfg = get_settings()
+        cfg_dump = json.dumps({k: str(v) for k, v in asdict(cfg).items()}, sort_keys=True)
+        payload["configuration_hash"] = hashlib.sha256(cfg_dump.encode("utf-8")).hexdigest()
+    except Exception:
+        payload["configuration_hash"] = None
+
+    # Calibration version & settings
+    cal_info = result.get("calibrator") or {}
+    payload["calibration_version"] = {
+        "calibrated": bool(result.get("calibrated", False)),
+        "alpha": cal_info.get("alpha"),
+        "n_cal": cal_info.get("n_cal"),
+    }
+
+    # Expert execution log
+    ev_list = result.get("evidence") or []
+    inv_steps = (result.get("investigation") or {}).get("steps") or []
+    payload["expert_execution_log"] = {
+        "executed_experts": [e.get("name") for e in ev_list if e.get("status") == "used"],
+        "skipped_experts": [e.get("name") for e in ev_list if e.get("status") == "skipped"],
+        "steps": inv_steps,
+    }
+
     cm = result.get("contradiction_map")
     if cm:
         payload["contradiction_map"] = {k: cm.get(k) for k in (

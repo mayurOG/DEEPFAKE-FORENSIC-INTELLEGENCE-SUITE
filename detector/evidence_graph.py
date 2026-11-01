@@ -169,49 +169,140 @@ def gls_fuse(
     corr: Optional[Dict[str, Dict[str, float]]] = None,
     max_abs_logit: float = 12.0,
     use_dependency: bool = True,
+    regularization: float = 0.05,
+    eps: float = 1e-6,
 ) -> Dict[str, Any]:
-    """Dependency-aware fused log-odds.
+    """Dependency-aware fused log-odds with regularized covariance estimation.
 
-    Returns dict(logit, sd, n_used, n_eff, sufficiency, birge, weights).
-    ``use_dependency=False`` forces independence (rho=0) for ablations."""
+    Regularized covariance:
+        Sigma_reg = (1 - lambda) * Sigma + lambda * diag(Sigma) + eps * I
+
+    Returns dict(logit, sd, n_used, n_eff, sufficiency, birge, weights, fallback_used).
+    ``use_dependency=False`` forces independence (rho=0) for ablations.
+    """
     used = _used(evidences)
     if not used:
         return {"logit": 0.0, "sd": math.inf, "n_used": 0, "n_eff": 0.0,
-                "sufficiency": 0.0, "birge": 1.0, "weights": {}}
+                "sufficiency": 0.0, "birge": 1.0, "weights": {}, "fallback_used": False}
     names = [e.name for e in used]
     z = np.array([np.clip(e.logit, -max_abs_logit, max_abs_logit) for e in used])
     prec = np.maximum(_precisions(used, weights), 1e-6)
     sigma = 1.0 / np.sqrt(prec)  # sigma_i^2 = 1 / precision_i
     R = _rho_matrix(names, corr) if use_dependency else np.eye(len(used))
     active = np.ones(len(used), dtype=bool)
+    fallback_used = False
+
     for _ in range(len(used)):
         idx = np.where(active)[0]
-        S = (R[np.ix_(idx, idx)] * np.outer(sigma[idx], sigma[idx])
-             + 1e-9 * np.eye(len(idx)))
-        Sinv1 = np.linalg.solve(S, np.ones(len(idx)))
-        denom = float(Sinv1.sum())
-        w_act = Sinv1 / denom
+        k_idx = len(idx)
+        raw_cov = R[np.ix_(idx, idx)] * np.outer(sigma[idx], sigma[idx])
+        # Regularized covariance: Sigma_reg = (1 - lam)*Sigma + lam*diag(Sigma) + eps*I
+        lam = float(np.clip(regularization, 0.0, 1.0)) if use_dependency else 0.0
+        diag_cov = np.diag(np.diag(raw_cov))
+        S = (1.0 - lam) * raw_cov + lam * diag_cov + (eps if use_dependency else 1e-9) * np.eye(k_idx)
+
+        # Condition check for ill-conditioned matrices
+        try:
+            cond = float(np.linalg.cond(S))
+        except Exception:
+            cond = float("inf")
+
+        if not np.isfinite(cond) or cond > 1e4:
+            # Fallback to regularized diagonal / precision-weighted mean
+            w_act = prec[idx] / prec[idx].sum()
+            fallback_used = True
+            denom = float(np.sum(1.0 / np.diag(S)))
+            break
+
+        try:
+            Sinv1 = np.linalg.solve(S, np.ones(k_idx))
+            denom = float(Sinv1.sum())
+            if denom <= 0:
+                raise np.linalg.LinAlgError("Non-positive denominator in GLS solve")
+            w_act = Sinv1 / denom
+        except np.linalg.LinAlgError:
+            w_act = prec[idx] / prec[idx].sum()
+            fallback_used = True
+            denom = float(np.sum(1.0 / np.diag(S)))
+            break
+
         if (w_act < -1e-12).any():
             active[idx[int(np.argmin(w_act))]] = False
             continue
         break
+
     w_full = np.zeros(len(used))
     w_full[idx] = np.clip(w_act, 0, None)
+    if w_full.sum() > 0:
+        w_full /= w_full.sum()
     mean = float(w_full @ z)
-    var = 1.0 / denom
+    var = 1.0 / denom if denom > 0 else 1.0
     k = int(active.sum())
     birge = 1.0
-    if k > 1:
+    if k > 1 and not fallback_used:
         resid = z[idx] - mean
-        Q = float(resid @ np.linalg.solve(S, resid))
-        birge = max(1.0, Q / (k - 1))
-    sd = math.sqrt(var * birge)
+        try:
+            Q = float(resid @ np.linalg.solve(S, resid))
+            birge = max(1.0, Q / (k - 1))
+        except Exception:
+            birge = 1.0
+    sd = math.sqrt(max(var, 1e-12) * birge)
     p = prec[idx]
-    n_eff = float(p.sum() ** 2 / (p @ R[np.ix_(idx, idx)] @ p))
+    denom_eff = float(p @ R[np.ix_(idx, idx)] @ p)
+    n_eff = float(p.sum() ** 2 / denom_eff) if denom_eff > 1e-12 else 1.0
     sufficiency = float(np.clip(abs(mean) / (1.645 * sd), 0.0, 1.0)) if sd > 0 else 1.0
     return {"logit": mean, "sd": sd, "n_used": len(used), "n_eff": n_eff,
-            "sufficiency": sufficiency, "birge": birge,
+            "sufficiency": sufficiency, "birge": birge, "fallback_used": fallback_used,
             "weights": {n: round(float(w), 4) for n, w in zip(names, w_full)}}
+
+
+def compare_fusion_baselines(
+    evidences: Sequence[Evidence],
+    weights: Optional[Dict[str, float]] = None,
+    corr: Optional[Dict[str, Dict[str, float]]] = None,
+) -> Dict[str, Any]:
+    """Compare four fusion configurations:
+    1. Individual best-performing expert (highest stated precision)
+    2. Simple probability averaging
+    3. Fixed weighted fusion
+    4. Learned GLS fusion
+    """
+    used = _used(evidences)
+    if not used:
+        return {}
+
+    # 1. Best expert
+    w_map = dict(DEFAULT_WEIGHTS)
+    if weights:
+        w_map.update(weights)
+    best_ev = max(used, key=lambda e: w_map.get(e.name, 0.3) * e.reliability)
+    best_expert = {
+        "name": best_ev.name,
+        "logit": float(best_ev.logit),
+        "p_fake": float(sigmoid(best_ev.logit)),
+    }
+
+    # 2. Simple probability averaging
+    p_raw = [float(sigmoid(e.logit)) for e in used]
+    simple_p = float(np.mean(p_raw))
+
+    # 3. Fixed weighted fusion
+    w_fixed = np.array([w_map.get(e.name, 0.3) * e.reliability for e in used])
+    w_fixed = w_fixed / (w_fixed.sum() + 1e-12)
+    z = np.array([float(e.logit) for e in used])
+    fixed_logit = float(w_fixed @ z)
+    fixed_p = float(sigmoid(fixed_logit))
+
+    # 4. Learned GLS fusion
+    gls_out = gls_fuse(evidences, weights, corr, use_dependency=True)
+    gls_p = float(sigmoid(gls_out["logit"]))
+
+    return {
+        "individual_best": best_expert,
+        "simple_averaging": {"p_fake": simple_p},
+        "fixed_weighted": {"logit": fixed_logit, "p_fake": fixed_p},
+        "learned_gls": {"logit": gls_out["logit"], "p_fake": gls_p, **gls_out},
+    }
 
 
 # --------------------------------------------------------------------------

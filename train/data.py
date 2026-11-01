@@ -35,8 +35,10 @@ class Item:
 
 
 def group_id(path: str, root: str = "") -> str:
-    rel = os.path.relpath(path, root) if root else path
-    d = os.path.dirname(rel)
+    norm_path = path.replace("\\", "/")
+    norm_root = root.replace("\\", "/") if root else ""
+    rel = os.path.relpath(norm_path, norm_root) if norm_root else norm_path
+    d = os.path.dirname(rel).replace("\\", "/")
     stem = os.path.splitext(os.path.basename(rel))[0]
     celeb_identity = re.match(r"^(id\d+)(?:_id\d+)?(?:[_-]\d+)?$", stem, re.I)
     if celeb_identity:
